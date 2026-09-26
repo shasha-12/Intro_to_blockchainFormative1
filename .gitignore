@@ -1,0 +1,4 @@
+*.o
+library_tracker
+chain.dat
+keys/*.pem
