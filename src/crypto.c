@@ -14,6 +14,20 @@ void crypto_sha256_hex(const unsigned char *data, size_t len, char out_hex[HASH_
     out_hex[HASH_HEX_LEN - 1] = '\0';
 }
 
+/* Deterministic on purpose: given the same inputs this always produces the
+ * same txid, with no internal clock read. That matters because a reward's
+ * txid is computed once when a RETURNED block is created (while it's still
+ * only pending), then reused unchanged when the reward is actually paid out
+ * at mining time - the on-chain record and the ledger entry must agree on
+ * one transaction ID, not two different ones generated at two different
+ * moments. */
+void crypto_compute_transaction_id(const char *from, const char *to, int amount,
+                                    time_t ts, char out_txid[HASH_HEX_LEN]) {
+    char buf[160];
+    int n = snprintf(buf, sizeof(buf), "%s|%s|%d|%ld", from, to, amount, (long)ts);
+    crypto_sha256_hex((unsigned char *)buf, (size_t)n, out_txid);
+}
+
 static EVP_PKEY *generate_keypair(void) {
     EVP_PKEY *pkey = EVP_EC_gen("P-256");
     if (pkey == NULL) {
@@ -58,6 +72,10 @@ static EVP_PKEY *load_private_key(const char *priv_path) {
     return pkey;
 }
 
+/* Reuses the same keypair across runs so a block signed in one session
+ * still verifies in the next - generating a fresh key every launch would
+ * make every previously-signed block fail verification the moment the
+ * program restarted. */
 int crypto_load_or_generate_keys(const char *priv_path, const char *pub_path, EVP_PKEY **out_pkey) {
     EVP_PKEY *pkey = load_private_key(priv_path);
     if (pkey != NULL) {

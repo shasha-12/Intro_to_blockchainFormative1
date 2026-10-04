@@ -1,4 +1,7 @@
 *.o
 library_tracker
 chain.dat
+pending_pool.dat
+utxo_set.dat
+account_ledger.dat
 keys/*.pem

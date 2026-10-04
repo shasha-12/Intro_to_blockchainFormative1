@@ -34,20 +34,28 @@ static void hex_encode(const unsigned char *data, unsigned int len, char *out) {
     out[len * 2] = '\0';
 }
 
+/* Covers only the transaction *content* - who did what, when, for what
+ * reward. Deliberately excludes index/previous_hash/nonce, because a block
+ * is signed the moment it's created (borrow/return time), long before its
+ * position in the chain or its mining nonce are known. */
 static size_t build_signable_buffer(const Block *b, char *out, size_t out_size) {
-    int n = snprintf(out, out_size, "%d|%ld|%s|%s|%s|%s|%s|%s",
-                      b->index, (long)b->timestamp, b->book_id, b->book_title,
-                      b->member_id, b->member_name, b->action, b->previous_hash);
+    int n = snprintf(out, out_size, "%ld|%s|%s|%s|%s|%s|%d|%s",
+                      (long)b->timestamp, b->book_id, b->book_title,
+                      b->member_id, b->member_name, b->action,
+                      b->token_reward, b->transaction_id);
     return n > 0 ? (size_t)n : 0;
 }
 
+/* Covers everything, including chain position and mining nonce - this is
+ * only computed once a block has actually been confirmed (mined). */
 static size_t build_full_buffer(const Block *b, char *out, size_t out_size) {
     char sig_hex[SIGNATURE_MAX_LEN * 2 + 1];
     hex_encode(b->signature, b->sig_len, sig_hex);
 
-    int n = snprintf(out, out_size, "%d|%ld|%s|%s|%s|%s|%s|%s|%s",
+    int n = snprintf(out, out_size, "%d|%ld|%s|%s|%s|%s|%s|%s|%d|%s|%s|%lu",
                       b->index, (long)b->timestamp, b->book_id, b->book_title,
-                      b->member_id, b->member_name, b->action, b->previous_hash, sig_hex);
+                      b->member_id, b->member_name, b->action, b->previous_hash,
+                      b->token_reward, b->transaction_id, sig_hex, b->nonce);
     return n > 0 ? (size_t)n : 0;
 }
 
@@ -75,6 +83,12 @@ static int sign_and_finalize(Block *b, EVP_PKEY *pkey) {
     return 1;
 }
 
+void blockchain_append_confirmed(Blockchain *chain, const Block *b) {
+    ensure_capacity(chain);
+    chain->blocks[chain->count] = *b;
+    chain->count++;
+}
+
 int blockchain_add_genesis(Blockchain *chain, EVP_PKEY *pkey) {
     ensure_capacity(chain);
     Block *b = &chain->blocks[chain->count];
@@ -89,26 +103,22 @@ int blockchain_add_genesis(Blockchain *chain, EVP_PKEY *pkey) {
     b->action[sizeof(b->action) - 1] = '\0';
     memset(b->previous_hash, '0', 64);
     b->previous_hash[64] = '\0';
+    b->nonce = 0;
+    b->token_reward = 0;
+    memset(b->transaction_id, '0', 64);
+    b->transaction_id[64] = '\0';
 
     if (!sign_and_finalize(b, pkey)) return 0;
     chain->count++;
     return 1;
 }
 
-int blockchain_add_block(Blockchain *chain, EVP_PKEY *pkey,
-                          const char *book_id, const char *book_title,
-                          const char *member_id, const char *member_name,
-                          const char *action) {
-    if (chain->count == 0) {
-        fprintf(stderr, "ERROR: Cannot add a block before the genesis block exists\n");
-        return 0;
-    }
-
-    ensure_capacity(chain);
-    Block *b = &chain->blocks[chain->count];
-    const Block *prev = &chain->blocks[chain->count - 1];
-
-    b->index = prev->index + 1;
+int blockchain_create_pending_block(Block *b, EVP_PKEY *pkey,
+                                     const char *book_id, const char *book_title,
+                                     const char *member_id, const char *member_name,
+                                     const char *action, int token_reward,
+                                     const char *transaction_id) {
+    b->index = -1; /* not yet placed in the chain - assigned at confirmation */
     b->timestamp = time(NULL);
     strncpy(b->book_id, book_id, sizeof(b->book_id) - 1);
     b->book_id[sizeof(b->book_id) - 1] = '\0';
@@ -120,12 +130,18 @@ int blockchain_add_block(Blockchain *chain, EVP_PKEY *pkey,
     b->member_name[sizeof(b->member_name) - 1] = '\0';
     strncpy(b->action, action, sizeof(b->action) - 1);
     b->action[sizeof(b->action) - 1] = '\0';
-    strncpy(b->previous_hash, prev->hash, sizeof(b->previous_hash) - 1);
-    b->previous_hash[sizeof(b->previous_hash) - 1] = '\0';
+    memset(b->previous_hash, '0', 64);
+    b->previous_hash[64] = '\0';
+    b->nonce = 0;
+    b->token_reward = token_reward;
+    strncpy(b->transaction_id, transaction_id, sizeof(b->transaction_id) - 1);
+    b->transaction_id[sizeof(b->transaction_id) - 1] = '\0';
+    memset(b->hash, '0', 64);
+    b->hash[64] = '\0';
 
-    if (!sign_and_finalize(b, pkey)) return 0;
-    chain->count++;
-    return 1;
+    char signable[SIGNABLE_BUF_SIZE];
+    size_t slen = build_signable_buffer(b, signable, sizeof(signable));
+    return crypto_sign(pkey, (unsigned char *)signable, slen, b->signature, &b->sig_len);
 }
 
 const Block *blockchain_last_action_for_book(const Blockchain *chain, const char *book_id) {
@@ -195,6 +211,7 @@ void blockchain_print_records(const Blockchain *chain, EVP_PKEY *pkey) {
             printf("  Book          : %s (%s)\n", b->book_title, b->book_id);
             printf("  Member        : %s (%s)\n", b->member_name, b->member_id);
             printf("  Action        : %s\n", b->action);
+            printf("  Token Reward  : %d\n", b->token_reward);
         }
         printf("  Previous Hash : %s\n", b->previous_hash);
         printf("  Hash          : %s\n", b->hash);
