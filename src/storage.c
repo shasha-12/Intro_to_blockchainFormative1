@@ -218,3 +218,71 @@ int storage_save_account_ledger(const AccountLedger *ledger, const char *path) {
     }
     return ok;
 }
+
+int storage_load_copy_inventory(CopyInventory *inv, const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) return 0;
+
+    int count = 0;
+    if (fread(&count, sizeof(int), 1, fp) != 1 || count < 0) {
+        fclose(fp);
+        return 0;
+    }
+    if (count > inv->capacity) {
+        inv->capacity = count > 0 ? count : 1;
+        inv->copies = realloc(inv->copies, sizeof(Copy) * (size_t)inv->capacity);
+    }
+    if (count > 0 && fread(inv->copies, sizeof(Copy), (size_t)count, fp) != (size_t)count) {
+        fclose(fp);
+        return 0;
+    }
+    inv->count = count;
+    fclose(fp);
+    return 1;
+}
+
+int storage_save_copy_inventory(const CopyInventory *inv, const char *path) {
+    FILE *fp = fopen(path, "wb");
+    if (fp == NULL) return 0;
+
+    int ok = fwrite(&inv->count, sizeof(int), 1, fp) == 1;
+    if (ok && inv->count > 0) {
+        ok = fwrite(inv->copies, sizeof(Copy), (size_t)inv->count, fp) == (size_t)inv->count;
+    }
+    fclose(fp);
+    return ok;
+}
+
+int storage_load_reservation_queue(ReservationQueue *q, const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) return 0;
+
+    int count = 0;
+    if (fread(&count, sizeof(int), 1, fp) != 1 || count < 0) {
+        fclose(fp);
+        return 0;
+    }
+    if (count > q->capacity) {
+        q->capacity = count > 0 ? count : 1;
+        q->entries = realloc(q->entries, sizeof(Reservation) * (size_t)q->capacity);
+    }
+    if (count > 0 && fread(q->entries, sizeof(Reservation), (size_t)count, fp) != (size_t)count) {
+        fclose(fp);
+        return 0;
+    }
+    q->count = count;
+    fclose(fp);
+    return 1;
+}
+
+int storage_save_reservation_queue(const ReservationQueue *q, const char *path) {
+    FILE *fp = fopen(path, "wb");
+    if (fp == NULL) return 0;
+
+    int ok = fwrite(&q->count, sizeof(int), 1, fp) == 1;
+    if (ok && q->count > 0) {
+        ok = fwrite(q->entries, sizeof(Reservation), (size_t)q->count, fp) == (size_t)q->count;
+    }
+    fclose(fp);
+    return ok;
+}

@@ -5,6 +5,7 @@
 #include "registry.h"
 #include "crypto.h"
 #include "blockchain.h"
+#include "inventory.h"
 #include "pending_pool.h"
 #include "mining.h"
 #include "utxo.h"
@@ -13,18 +14,20 @@
 
 #define BOOKS_FILE "books.txt"
 #define MEMBERS_FILE "members.txt"
+#define COPIES_FILE "copies.txt"
 #define CHAIN_FILE "chain.dat"
 #define POOL_FILE "pending_pool.dat"
 #define UTXO_FILE "utxo_set.dat"
 #define ACCOUNT_FILE "account_ledger.dat"
+#define COPY_STATE_FILE "copy_inventory.dat"
+#define RESERVATION_FILE "reservation_queue.dat"
 #define NETWORK_ACCOUNT "NETWORK"
 #define PRIV_KEY_FILE "keys/private.pem"
 #define PUB_KEY_FILE "keys/public.pem"
 
-/* A book returned within this many seconds of being borrowed counts as
- * on-time (10 coins); anything later counts as late (5 coins). A real
- * loan period would be measured in days, but that isn't demoable inside
- * a short video, so this is a deliberate simulation shortcut - documented
+/* A book borrowed now is due this many seconds later - a real loan
+ * period would be measured in days, but that isn't demoable inside a
+ * short video, so this is a deliberate simulation shortcut, documented
  * as such in the technical report. */
 #define LOAN_PERIOD_SECONDS 15
 
@@ -32,12 +35,9 @@ static const char *model_name(TransactionModel model) {
     return model == MODEL_UTXO ? "UTXO" : "Account-based";
 }
 
-/* Returns 1 on a normal read, 0 on EOF/read error (buf is left as an
- * empty string either way, so existing callers that ignore the return
- * value keep working - they just see an empty input, same as before).
- * The main menu loop checks this specifically so that running out of
- * piped/redirected input exits cleanly instead of spinning forever on
- * atoi("") never matching a menu case. */
+/* Returns 1 on a normal read, 0 on EOF/read error. The main command loop
+ * checks this specifically so that running out of piped/redirected
+ * input exits cleanly instead of spinning forever. */
 static int read_line(char *buf, size_t size) {
     if (fgets(buf, (int)size, stdin) == NULL) {
         buf[0] = '\0';
@@ -50,30 +50,36 @@ static int read_line(char *buf, size_t size) {
     return 1;
 }
 
-static void print_menu(int difficulty, TransactionModel model) {
-    printf("\n===== Library Lending Tracker ===== [active model: %s]\n", model_name(model));
-    printf("1. Borrow Book\n");
-    printf("2. Return Book\n");
-    printf("3. View Pending Pool\n");
-    printf("4. Mine Pending Pool (Solo)\n");
-    printf("5. Mine Pending Pool (Pool)\n");
-    printf("6. Mine Pending Pool (Cloud)\n");
-    printf("7. View Lending Records (confirmed)\n");
-    printf("8. Validate Chain\n");
-    printf("--- UTXO model ---\n");
-    printf("9. View Token Balances & UTXO Set\n");
-    printf("10. Send Tokens (UTXO Transfer)\n");
-    printf("11. Credit Test Reward (UTXO Mint - dev/test hook)\n");
-    printf("--- Account model ---\n");
-    printf("12. View Account Balances\n");
-    printf("13. Send Tokens (Account Transfer)\n");
-    printf("14. View Transaction History (Account model)\n");
-    printf("15. Credit Test Reward (Account model - dev/test hook)\n");
-    printf("--- System ---\n");
-    printf("16. Set Mining Difficulty (current: %d)\n", difficulty);
-    printf("17. Tamper With a Past Block (Demo)\n");
-    printf("18. Exit\n");
-    printf("Choose an option: ");
+/* Splits one input line into a command word and whatever (optionally
+ * empty) trailing argument follows it, e.g. "mine_cloud 3" -> cmd=
+ * "mine_cloud", arg="3". Commands that take their argument inline
+ * (mine_cloud, transaction_history, mark_lost) use arg directly if
+ * present and prompt for it otherwise. */
+static void split_command(char *line, char **cmd, char **arg) {
+    *cmd = line;
+    *arg = NULL;
+    char *space = strchr(line, ' ');
+    if (space != NULL) {
+        *space = '\0';
+        char *rest = space + 1;
+        while (*rest == ' ') rest++;
+        if (*rest != '\0') *arg = rest;
+    }
+}
+
+static void print_commands(int difficulty, TransactionModel model) {
+    printf("\n===== Library Lending Tracker ===== [model: %s, difficulty: %d]\n",
+           model_name(model), difficulty);
+    printf("Book/Copy:    register_book  view_book  add_copy  view_copy  mark_lost\n");
+    printf("Lending:      borrow_book  return_book  reserve_book  reservation_status\n");
+    printf("Pool/Mining:  pool_view  mine_solo  mine_pool  mine_cloud <rounds>\n");
+    printf("              difficulty_status  set_difficulty\n");
+    printf("Chain:        chain_view  validate_chain  chain_save  chain_load  tamper_block\n");
+    printf("Tokens:       utxo_view  token_transfer  token_balance  credit_test_utxo\n");
+    printf("              account_balance  account_transfer  account_nonce\n");
+    printf("              transaction_history <member_id>  credit_test_account\n");
+    printf("System:       help  exit\n");
+    printf("> ");
 }
 
 /* A copy's current loan status is decided by whichever record is more
@@ -98,8 +104,138 @@ static unsigned long next_record_id(const Blockchain *chain, const PendingPool *
     return count + 1;
 }
 
-static void handle_borrow(PendingPool *pool, const Blockchain *chain,
-                           const Registry *reg, EVP_PKEY *pkey) {
+static void save_inventory_state(const CopyInventory *inv, const ReservationQueue *q) {
+    storage_save_copy_inventory(inv, COPY_STATE_FILE);
+    storage_save_reservation_queue(q, RESERVATION_FILE);
+}
+
+static void handle_register_book(Registry *reg) {
+    char book_id[20], title[80], author[50];
+    printf("Book ID: ");
+    read_line(book_id, sizeof(book_id));
+    printf("Title: ");
+    read_line(title, sizeof(title));
+    printf("Author: ");
+    read_line(author, sizeof(author));
+
+    if (registry_find_book(reg, book_id) != NULL) {
+        printf("ERROR: Book ID '%s' already exists\n", book_id);
+        return;
+    }
+    if (reg->book_count >= MAX_BOOKS) {
+        printf("ERROR: Book registry is full\n");
+        return;
+    }
+
+    Book *b = &reg->books[reg->book_count];
+    strncpy(b->book_id, book_id, sizeof(b->book_id) - 1);
+    strncpy(b->title, title, sizeof(b->title) - 1);
+    strncpy(b->author, author, sizeof(b->author) - 1);
+    reg->book_count++;
+    printf("OK: Registered '%s' by %s (%s)\n", title, author, book_id);
+}
+
+static void handle_view_book(const Registry *reg) {
+    char book_id[20];
+    printf("Book ID: ");
+    read_line(book_id, sizeof(book_id));
+    const Book *b = registry_find_book(reg, book_id);
+    if (b == NULL) {
+        printf("ERROR: Book '%s' not found\n", book_id);
+        return;
+    }
+    printf("  %s: '%s' by %s\n", b->book_id, b->title, b->author);
+}
+
+static void handle_add_copy(CopyInventory *inv, ReservationQueue *q, const Registry *reg) {
+    char copy_id[20], book_id[20], condition[10];
+    printf("Copy ID: ");
+    read_line(copy_id, sizeof(copy_id));
+    printf("Book ID: ");
+    read_line(book_id, sizeof(book_id));
+    printf("Condition (NEW/GOOD/WORN): ");
+    read_line(condition, sizeof(condition));
+
+    if (registry_find_book(reg, book_id) == NULL) {
+        printf("ERROR: Book '%s' not found\n", book_id);
+        return;
+    }
+    if (copy_inventory_find(inv, copy_id) != NULL) {
+        printf("ERROR: Copy ID '%s' already exists\n", copy_id);
+        return;
+    }
+
+    Copy c = {0};
+    strncpy(c.copy_id, copy_id, sizeof(c.copy_id) - 1);
+    strncpy(c.book_id, book_id, sizeof(c.book_id) - 1);
+    strncpy(c.condition, condition, sizeof(c.condition) - 1);
+    strncpy(c.state, COPY_STATE_AVAILABLE, sizeof(c.state) - 1);
+
+    /* Reuses the inventory's own growable array by going through find()
+     * after a manual append would be circular, so this mirrors
+     * copy_inventory_load's insertion instead. */
+    if (inv->count >= inv->capacity) {
+        inv->capacity *= 2;
+        inv->copies = realloc(inv->copies, sizeof(Copy) * (size_t)inv->capacity);
+    }
+    inv->copies[inv->count] = c;
+    inv->count++;
+
+    save_inventory_state(inv, q);
+    printf("OK: Added copy '%s' of '%s', condition %s, state AVAILABLE\n", copy_id, book_id, condition);
+}
+
+static void handle_view_copy(CopyInventory *inv) {
+    char copy_id[20];
+    printf("Copy ID (blank for all): ");
+    read_line(copy_id, sizeof(copy_id));
+    if (copy_id[0] == '\0') {
+        copy_inventory_print(inv);
+        return;
+    }
+    Copy *c = copy_inventory_find(inv, copy_id);
+    if (c == NULL) {
+        printf("ERROR: Copy '%s' not found\n", copy_id);
+        return;
+    }
+    copy_inventory_print_one(c);
+}
+
+static void handle_mark_lost(CopyInventory *inv, ReservationQueue *q, const char *arg) {
+    char copy_id[20], reason[80];
+    if (arg != NULL) {
+        strncpy(copy_id, arg, sizeof(copy_id) - 1);
+        copy_id[sizeof(copy_id) - 1] = '\0';
+    } else {
+        printf("Copy ID: ");
+        read_line(copy_id, sizeof(copy_id));
+    }
+    printf("Reason code: ");
+    read_line(reason, sizeof(reason));
+
+    if (reason[0] == '\0') {
+        printf("ERROR: A reason code is required for a LOST override\n");
+        return;
+    }
+
+    Copy *c = copy_inventory_find(inv, copy_id);
+    if (c == NULL) {
+        printf("ERROR: Copy '%s' not found\n", copy_id);
+        return;
+    }
+    if (strcmp(c->state, COPY_STATE_AVAILABLE) != 0 && strcmp(c->state, COPY_STATE_BORROWED) != 0) {
+        printf("ERROR: Copy '%s' is already %s, cannot mark lost\n", copy_id, c->state);
+        return;
+    }
+
+    strncpy(c->state, COPY_STATE_LOST, sizeof(c->state) - 1);
+    c->state[sizeof(c->state) - 1] = '\0';
+    save_inventory_state(inv, q);
+    printf("OK: Copy '%s' marked LOST (reason: %s)\n", copy_id, reason);
+}
+
+static void handle_borrow(PendingPool *pool, const Blockchain *chain, const Registry *reg,
+                           CopyInventory *inv, ReservationQueue *reservations, EVP_PKEY *pkey) {
     char book_id[20], member_id[20];
 
     printf("Enter Book ID: ");
@@ -115,18 +251,21 @@ static void handle_borrow(PendingPool *pool, const Blockchain *chain,
         return;
     }
 
-    /* Single-copy-per-title for now - copy_id tracks book_id directly
-     * until copy-level inventory (copies.txt) lands. */
-    const LendingRecord *last = current_loan_status(pool, chain, book_id);
-    if (last != NULL && strcmp(last->action, ACTION_BORROWED) == 0) {
-        printf("ERROR: '%s' is already on loan and has not been returned\n", book->title);
+    /* A member picking up their own reservation claims that exact copy;
+     * otherwise any generally-available copy of the title is offered. */
+    Copy *copy = copy_inventory_find_reserved_for(inv, book_id, member_id);
+    if (copy == NULL) {
+        copy = copy_inventory_find_available(inv, book_id);
+    }
+    if (copy == NULL) {
+        printf("ERROR: No available copy of '%s' - use reserve_book to join the queue\n", book->title);
         return;
     }
 
     LendingRecord rec = {0};
     rec.record_id = next_record_id(chain, pool);
     strncpy(rec.book_id, book->book_id, sizeof(rec.book_id) - 1);
-    strncpy(rec.copy_id, book->book_id, sizeof(rec.copy_id) - 1);
+    strncpy(rec.copy_id, copy->copy_id, sizeof(rec.copy_id) - 1);
     strncpy(rec.book_title, book->title, sizeof(rec.book_title) - 1);
     strncpy(rec.member_id, member->member_id, sizeof(rec.member_id) - 1);
     strncpy(rec.member_name, member->full_name, sizeof(rec.member_name) - 1);
@@ -143,18 +282,33 @@ static void handle_borrow(PendingPool *pool, const Blockchain *chain,
 
     pending_pool_add(pool, &rec);
     storage_save_pending_pool(pool, POOL_FILE);
-    printf("OK: '%s' borrow by %s added to the pending pool - awaiting mining.\n",
-           book->title, member->full_name);
+
+    strncpy(copy->state, COPY_STATE_BORROWED, sizeof(copy->state) - 1);
+    copy->state[sizeof(copy->state) - 1] = '\0';
+    strncpy(copy->current_holder_id, member->member_id, sizeof(copy->current_holder_id) - 1);
+    copy->current_holder_id[sizeof(copy->current_holder_id) - 1] = '\0';
+    copy->due_date = rec.due_date;
+    save_inventory_state(inv, reservations);
+
+    printf("OK: '%s' (copy %s) borrow by %s added to the pending pool - awaiting mining.\n",
+           book->title, copy->copy_id, member->full_name);
 }
 
-static void handle_return(PendingPool *pool, const Blockchain *chain, EVP_PKEY *pkey) {
-    char book_id[20];
-    printf("Enter Book ID: ");
-    read_line(book_id, sizeof(book_id));
+static void handle_return(PendingPool *pool, const Blockchain *chain,
+                           CopyInventory *inv, ReservationQueue *reservations, EVP_PKEY *pkey) {
+    char copy_id[20];
+    printf("Enter Copy ID: ");
+    read_line(copy_id, sizeof(copy_id));
 
-    const LendingRecord *last = current_loan_status(pool, chain, book_id);
+    const LendingRecord *last = current_loan_status(pool, chain, copy_id);
     if (last == NULL || strcmp(last->action, ACTION_BORROWED) != 0) {
-        printf("ERROR: No active loan found for book ID '%s'\n", book_id);
+        printf("ERROR: No active loan found for copy ID '%s'\n", copy_id);
+        return;
+    }
+
+    Copy *copy = copy_inventory_find(inv, copy_id);
+    if (copy == NULL) {
+        printf("ERROR: Copy '%s' is not in the inventory\n", copy_id);
         return;
     }
 
@@ -178,9 +332,52 @@ static void handle_return(PendingPool *pool, const Blockchain *chain, EVP_PKEY *
 
     pending_pool_add(pool, &rec);
     storage_save_pending_pool(pool, POOL_FILE);
-    printf("OK: '%s' return by %s added to the pending pool - awaiting mining (%s, reward decided on confirmation).\n",
-           last->book_title, last->member_name,
-           rec.timestamp <= last->due_date ? "on-time" : "late");
+
+    /* BORROWED -> AVAILABLE, or RESERVED (held for the next member in
+     * line) if anyone is waiting for this title. */
+    char next_member[20];
+    if (reservation_queue_pop_next(reservations, copy->book_id, next_member)) {
+        strncpy(copy->state, COPY_STATE_RESERVED, sizeof(copy->state) - 1);
+        strncpy(copy->current_holder_id, next_member, sizeof(copy->current_holder_id) - 1);
+        printf("OK: '%s' return by %s added to the pending pool - awaiting mining (%s). Copy %s now held for %s.\n",
+               last->book_title, last->member_name,
+               rec.timestamp <= last->due_date ? "on-time" : "late", copy_id, next_member);
+    } else {
+        strncpy(copy->state, COPY_STATE_AVAILABLE, sizeof(copy->state) - 1);
+        copy->current_holder_id[0] = '\0';
+        printf("OK: '%s' return by %s added to the pending pool - awaiting mining (%s, reward decided on confirmation).\n",
+               last->book_title, last->member_name,
+               rec.timestamp <= last->due_date ? "on-time" : "late");
+    }
+    copy->state[sizeof(copy->state) - 1] = '\0';
+    copy->current_holder_id[sizeof(copy->current_holder_id) - 1] = '\0';
+    copy->due_date = 0;
+    save_inventory_state(inv, reservations);
+}
+
+static void handle_reserve_book(const Registry *reg, CopyInventory *inv, ReservationQueue *reservations) {
+    char book_id[20], member_id[20];
+    printf("Book ID: ");
+    read_line(book_id, sizeof(book_id));
+    printf("Member ID: ");
+    read_line(member_id, sizeof(member_id));
+
+    if (registry_find_book(reg, book_id) == NULL || registry_find_member(reg, member_id) == NULL) {
+        printf("ERROR: Book or Member not found\n");
+        return;
+    }
+    if (copy_inventory_find_available(inv, book_id) != NULL) {
+        printf("ERROR: A copy of '%s' is currently available - borrow it directly instead\n", book_id);
+        return;
+    }
+
+    reservation_queue_add(reservations, book_id, member_id);
+    save_inventory_state(inv, reservations);
+    printf("OK: %s added to the reservation queue for '%s'\n", member_id, book_id);
+}
+
+static void handle_reservation_status(const ReservationQueue *reservations) {
+    reservation_queue_print(reservations);
 }
 
 static void save_ledgers(TransactionModel model, UTXOSet *utxos, AccountLedger *accounts) {
@@ -193,7 +390,7 @@ static void save_ledgers(TransactionModel model, UTXOSet *utxos, AccountLedger *
 
 /* The brief requires the full UTXO set to be shown after each confirmed
  * block, so mining prints the active ledger's state automatically instead
- * of leaving it to a separate menu option the user might not pick. */
+ * of leaving it to a separate command the user might not run. */
 static void print_ledger_state(TransactionModel model, UTXOSet *utxos, AccountLedger *accounts) {
     if (model == MODEL_UTXO) {
         utxo_print_set(utxos);
@@ -236,16 +433,23 @@ static void handle_mine_pool(Blockchain *chain, PendingPool *pool, int difficult
 }
 
 static void handle_mine_cloud(Blockchain *chain, PendingPool *pool, int difficulty,
-                               TransactionModel model, UTXOSet *utxos, AccountLedger *accounts) {
+                               TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
+                               const char *arg) {
     char renter_id[50], input[16];
     printf("Enter Renter ID: ");
     read_line(renter_id, sizeof(renter_id));
     if (renter_id[0] == '\0') {
         strcpy(renter_id, "CLOUD_RENTER");
     }
-    printf("Number of rounds (%d-%d): ", MIN_CLOUD_ROUNDS, MAX_CLOUD_ROUNDS);
-    read_line(input, sizeof(input));
-    int rounds = atoi(input);
+
+    int rounds;
+    if (arg != NULL) {
+        rounds = atoi(arg);
+    } else {
+        printf("Number of rounds (%d-%d): ", MIN_CLOUD_ROUNDS, MAX_CLOUD_ROUNDS);
+        read_line(input, sizeof(input));
+        rounds = atoi(input);
+    }
 
     CloudRound rounds_out[MAX_CLOUD_ROUNDS];
     mining_cloud(chain, pool, difficulty, rounds, renter_id, model, utxos, accounts, rounds_out);
@@ -300,9 +504,16 @@ static void handle_utxo_send(UTXOSet *utxos) {
            amount, from, to, UTXO_FEE, NETWORK_ACCOUNT, txid);
 }
 
+static void handle_token_balance(UTXOSet *utxos) {
+    char member_id[20];
+    printf("Member ID: ");
+    read_line(member_id, sizeof(member_id));
+    printf("  %s: %d coins\n", member_id, utxo_balance(utxos, member_id));
+}
+
 /* A manual test utility for crediting an arbitrary amount outside the
  * normal borrow/return/mine flow - useful for setting up balances to
- * demo "Send Tokens" or edge cases without waiting on a real loan cycle. */
+ * demo token_transfer or edge cases without waiting on a real loan cycle. */
 static void handle_utxo_credit_test(UTXOSet *utxos) {
     char member_id[20], input[16];
     printf("Credit which member ID: ");
@@ -360,10 +571,22 @@ static void handle_account_send(AccountLedger *ledger) {
     }
 }
 
-static void handle_account_history(AccountLedger *ledger) {
+static void handle_account_nonce(AccountLedger *ledger) {
     char member_id[20];
     printf("Member ID: ");
     read_line(member_id, sizeof(member_id));
+    printf("  %s: next nonce %lu\n", member_id, account_get_or_create(ledger, member_id)->nonce);
+}
+
+static void handle_account_history(AccountLedger *ledger, const char *arg) {
+    char member_id[20];
+    if (arg != NULL) {
+        strncpy(member_id, arg, sizeof(member_id) - 1);
+        member_id[sizeof(member_id) - 1] = '\0';
+    } else {
+        printf("Member ID: ");
+        read_line(member_id, sizeof(member_id));
+    }
     account_print_history(ledger, member_id);
 }
 
@@ -415,7 +638,7 @@ static void handle_tamper_demo(Blockchain *chain) {
     rec->book_title[sizeof(rec->book_title) - 1] = '\0';
 
     storage_save_chain(chain, CHAIN_FILE);
-    printf("Block %d modified in memory and on disk. Run 'Validate Chain' to see it detected.\n", idx);
+    printf("Block %d modified in memory and on disk. Run 'validate_chain' to see it detected.\n", idx);
 }
 
 int main(int argc, char *argv[]) {
@@ -485,6 +708,22 @@ int main(int argc, char *argv[]) {
     account_ledger_init(&accounts);
     storage_load_account_ledger(&accounts, ACCOUNT_FILE);
 
+    CopyInventory inv;
+    copy_inventory_init(&inv);
+    if (!storage_load_copy_inventory(&inv, COPY_STATE_FILE)) {
+        if (!copy_inventory_load(&inv, COPIES_FILE, &reg)) {
+            fprintf(stderr, "FATAL: Could not start — copy inventory missing or empty.\n");
+            return 1;
+        }
+        printf("Loaded %d physical copies from %s.\n", inv.count, COPIES_FILE);
+    } else {
+        printf("Loaded existing copy inventory with %d copies.\n", inv.count);
+    }
+
+    ReservationQueue reservations;
+    reservation_queue_init(&reservations);
+    storage_load_reservation_queue(&reservations, RESERVATION_FILE);
+
     if (!model_set_by_arg) {
         printf("\nChoose a transaction model for this session:\n");
         printf("  1. UTXO\n");
@@ -499,93 +738,109 @@ int main(int argc, char *argv[]) {
 
     int running = 1;
     while (running) {
-        print_menu(difficulty, model);
-        char input[16];
+        print_commands(difficulty, model);
+        char input[256];
         if (!read_line(input, sizeof(input))) {
             printf("\nInput closed - exiting.\n");
             break;
         }
-        int choice = atoi(input);
+        char *cmd, *arg;
+        split_command(input, &cmd, &arg);
 
-        switch (choice) {
-            case 1:
-                handle_borrow(&pool, &chain, &reg, pkey);
-                break;
-            case 2:
-                handle_return(&pool, &chain, pkey);
-                break;
-            case 3:
-                pending_pool_print(&pool);
-                break;
-            case 4:
-                handle_mine_solo(&chain, &pool, difficulty, model, &utxos, &accounts);
-                break;
-            case 5:
-                handle_mine_pool(&chain, &pool, difficulty, model, &utxos, &accounts);
-                break;
-            case 6:
-                handle_mine_cloud(&chain, &pool, difficulty, model, &utxos, &accounts);
-                break;
-            case 7:
-                blockchain_print_records(&chain, pkey);
-                break;
-            case 8: {
-                int valid = blockchain_validate(&chain, pkey);
-                printf(valid ? "\nChain is VALID — no tampering detected.\n"
-                             : "\nChain is INVALID — tampering detected!\n");
-                break;
+        if (strcmp(cmd, "") == 0) {
+            continue;
+        } else if (strcmp(cmd, "help") == 0) {
+            continue;
+        } else if (strcmp(cmd, "register_book") == 0) {
+            handle_register_book(&reg);
+        } else if (strcmp(cmd, "view_book") == 0) {
+            handle_view_book(&reg);
+        } else if (strcmp(cmd, "add_copy") == 0) {
+            handle_add_copy(&inv, &reservations, &reg);
+        } else if (strcmp(cmd, "view_copy") == 0) {
+            handle_view_copy(&inv);
+        } else if (strcmp(cmd, "mark_lost") == 0) {
+            handle_mark_lost(&inv, &reservations, arg);
+        } else if (strcmp(cmd, "borrow_book") == 0) {
+            handle_borrow(&pool, &chain, &reg, &inv, &reservations, pkey);
+        } else if (strcmp(cmd, "return_book") == 0) {
+            handle_return(&pool, &chain, &inv, &reservations, pkey);
+        } else if (strcmp(cmd, "reserve_book") == 0) {
+            handle_reserve_book(&reg, &inv, &reservations);
+        } else if (strcmp(cmd, "reservation_status") == 0) {
+            handle_reservation_status(&reservations);
+        } else if (strcmp(cmd, "pool_view") == 0) {
+            pending_pool_print(&pool);
+        } else if (strcmp(cmd, "mine_solo") == 0) {
+            handle_mine_solo(&chain, &pool, difficulty, model, &utxos, &accounts);
+        } else if (strcmp(cmd, "mine_pool") == 0) {
+            handle_mine_pool(&chain, &pool, difficulty, model, &utxos, &accounts);
+        } else if (strcmp(cmd, "mine_cloud") == 0) {
+            handle_mine_cloud(&chain, &pool, difficulty, model, &utxos, &accounts, arg);
+        } else if (strcmp(cmd, "difficulty_status") == 0) {
+            printf("Current mining difficulty: %d (range %d-%d)\n", difficulty, MIN_DIFFICULTY, MAX_DIFFICULTY);
+        } else if (strcmp(cmd, "set_difficulty") == 0) {
+            difficulty = handle_set_difficulty(difficulty);
+        } else if (strcmp(cmd, "chain_view") == 0) {
+            blockchain_print_records(&chain, pkey);
+        } else if (strcmp(cmd, "validate_chain") == 0) {
+            int valid = blockchain_validate(&chain, pkey);
+            printf(valid ? "\nChain is VALID — no tampering detected.\n"
+                         : "\nChain is INVALID — tampering detected!\n");
+        } else if (strcmp(cmd, "chain_save") == 0) {
+            storage_save_chain(&chain, CHAIN_FILE);
+            printf("OK: Chain saved to %s\n", CHAIN_FILE);
+        } else if (strcmp(cmd, "chain_load") == 0) {
+            if (storage_load_chain(&chain, CHAIN_FILE)) {
+                printf("OK: Chain reloaded from %s (%d blocks)\n", CHAIN_FILE, chain.count);
+            } else {
+                printf("ERROR: Could not load %s\n", CHAIN_FILE);
             }
-            case 9:
-                utxo_print_set(&utxos);
-                break;
-            case 10:
-                if (model != MODEL_UTXO) {
-                    printf("ERROR: UTXO model is not active this session (active: %s)\n", model_name(model));
-                } else {
-                    handle_utxo_send(&utxos);
-                }
-                break;
-            case 11:
-                if (model != MODEL_UTXO) {
-                    printf("ERROR: UTXO model is not active this session (active: %s)\n", model_name(model));
-                } else {
-                    handle_utxo_credit_test(&utxos);
-                }
-                break;
-            case 12:
-                account_print_all(&accounts);
-                break;
-            case 13:
-                if (model != MODEL_ACCOUNT) {
-                    printf("ERROR: Account model is not active this session (active: %s)\n", model_name(model));
-                } else {
-                    handle_account_send(&accounts);
-                }
-                break;
-            case 14:
-                handle_account_history(&accounts);
-                break;
-            case 15:
-                if (model != MODEL_ACCOUNT) {
-                    printf("ERROR: Account model is not active this session (active: %s)\n", model_name(model));
-                } else {
-                    handle_account_credit_test(&accounts);
-                }
-                break;
-            case 16:
-                difficulty = handle_set_difficulty(difficulty);
-                break;
-            case 17:
-                handle_tamper_demo(&chain);
-                break;
-            case 18:
-                running = 0;
-                break;
-            default:
-                printf("Invalid option. Please choose 1-18.\n");
+        } else if (strcmp(cmd, "tamper_block") == 0) {
+            handle_tamper_demo(&chain);
+        } else if (strcmp(cmd, "utxo_view") == 0) {
+            utxo_print_set(&utxos);
+        } else if (strcmp(cmd, "token_transfer") == 0) {
+            if (model != MODEL_UTXO) {
+                printf("ERROR: UTXO model is not active this session (active: %s)\n", model_name(model));
+            } else {
+                handle_utxo_send(&utxos);
+            }
+        } else if (strcmp(cmd, "token_balance") == 0) {
+            handle_token_balance(&utxos);
+        } else if (strcmp(cmd, "credit_test_utxo") == 0) {
+            if (model != MODEL_UTXO) {
+                printf("ERROR: UTXO model is not active this session (active: %s)\n", model_name(model));
+            } else {
+                handle_utxo_credit_test(&utxos);
+            }
+        } else if (strcmp(cmd, "account_balance") == 0) {
+            account_print_all(&accounts);
+        } else if (strcmp(cmd, "account_transfer") == 0) {
+            if (model != MODEL_ACCOUNT) {
+                printf("ERROR: Account model is not active this session (active: %s)\n", model_name(model));
+            } else {
+                handle_account_send(&accounts);
+            }
+        } else if (strcmp(cmd, "account_nonce") == 0) {
+            handle_account_nonce(&accounts);
+        } else if (strcmp(cmd, "transaction_history") == 0) {
+            handle_account_history(&accounts, arg);
+        } else if (strcmp(cmd, "credit_test_account") == 0) {
+            if (model != MODEL_ACCOUNT) {
+                printf("ERROR: Account model is not active this session (active: %s)\n", model_name(model));
+            } else {
+                handle_account_credit_test(&accounts);
+            }
+        } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
+            running = 0;
+        } else {
+            printf("Unknown command '%s'. Type 'help' to see the command list.\n", cmd);
         }
     }
 
+    reservation_queue_free(&reservations);
+    copy_inventory_free(&inv);
     account_ledger_free(&accounts);
     utxo_set_free(&utxos);
     pending_pool_free(&pool);
