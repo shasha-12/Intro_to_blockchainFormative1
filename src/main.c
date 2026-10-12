@@ -27,8 +27,6 @@
  * a short video, so this is a deliberate simulation shortcut - documented
  * as such in the technical report. */
 #define LOAN_PERIOD_SECONDS 15
-#define REWARD_ON_TIME 10
-#define REWARD_LATE 5
 
 static const char *model_name(TransactionModel model) {
     return model == MODEL_UTXO ? "UTXO" : "Account-based";
@@ -78,15 +76,26 @@ static void print_menu(int difficulty, TransactionModel model) {
     printf("Choose an option: ");
 }
 
-/* A book's current loan status is decided by whichever record is more
+/* A copy's current loan status is decided by whichever record is more
  * recent: an unconfirmed one still sitting in the pending pool, or the
  * last confirmed one on the chain. The pending pool is checked first
  * since anything in it is, by definition, newer than the chain tip. */
-static const Block *current_loan_status(const PendingPool *pool, const Blockchain *chain,
-                                         const char *book_id) {
-    const Block *pending = pending_pool_last_action_for_book(pool, book_id);
+static const LendingRecord *current_loan_status(const PendingPool *pool, const Blockchain *chain,
+                                                  const char *copy_id) {
+    const LendingRecord *pending = pending_pool_last_action_for_copy(pool, copy_id);
     if (pending != NULL) return pending;
-    return blockchain_last_action_for_book(chain, book_id);
+    return blockchain_last_action_for_copy(chain, copy_id);
+}
+
+/* record_id just needs to be unique across the chain and pool, not
+ * sequential or gap-free, so the simplest honest source is a counter
+ * seeded from how many records already exist in both places. */
+static unsigned long next_record_id(const Blockchain *chain, const PendingPool *pool) {
+    unsigned long count = (unsigned long)pool->count;
+    for (int i = 0; i < chain->count; i++) {
+        count += (unsigned long)chain->blocks[i].record_count;
+    }
+    return count + 1;
 }
 
 static void handle_borrow(PendingPool *pool, const Blockchain *chain,
@@ -106,25 +115,33 @@ static void handle_borrow(PendingPool *pool, const Blockchain *chain,
         return;
     }
 
-    const Block *last = current_loan_status(pool, chain, book_id);
+    /* Single-copy-per-title for now - copy_id tracks book_id directly
+     * until copy-level inventory (copies.txt) lands. */
+    const LendingRecord *last = current_loan_status(pool, chain, book_id);
     if (last != NULL && strcmp(last->action, ACTION_BORROWED) == 0) {
         printf("ERROR: '%s' is already on loan and has not been returned\n", book->title);
         return;
     }
 
-    char zero_txid[HASH_HEX_LEN];
-    memset(zero_txid, '0', 64);
-    zero_txid[64] = '\0';
+    LendingRecord rec = {0};
+    rec.record_id = next_record_id(chain, pool);
+    strncpy(rec.book_id, book->book_id, sizeof(rec.book_id) - 1);
+    strncpy(rec.copy_id, book->book_id, sizeof(rec.copy_id) - 1);
+    strncpy(rec.book_title, book->title, sizeof(rec.book_title) - 1);
+    strncpy(rec.member_id, member->member_id, sizeof(rec.member_id) - 1);
+    strncpy(rec.member_name, member->full_name, sizeof(rec.member_name) - 1);
+    strncpy(rec.action, ACTION_BORROWED, sizeof(rec.action) - 1);
+    rec.timestamp = time(NULL);
+    rec.due_date = rec.timestamp + LOAN_PERIOD_SECONDS;
+    rec.fine_amount = 0;
+    rec.nonce = 0;
 
-    Block pending;
-    if (!blockchain_create_pending_block(&pending, pkey, book->book_id, book->title,
-                                          member->member_id, member->full_name, ACTION_BORROWED,
-                                          0, zero_txid)) {
-        printf("ERROR: Failed to record borrow transaction\n");
+    if (!blockchain_sign_record(&rec, pkey)) {
+        printf("ERROR: Failed to sign borrow request\n");
         return;
     }
 
-    pending_pool_add(pool, &pending);
+    pending_pool_add(pool, &rec);
     storage_save_pending_pool(pool, POOL_FILE);
     printf("OK: '%s' borrow by %s added to the pending pool - awaiting mining.\n",
            book->title, member->full_name);
@@ -135,32 +152,35 @@ static void handle_return(PendingPool *pool, const Blockchain *chain, EVP_PKEY *
     printf("Enter Book ID: ");
     read_line(book_id, sizeof(book_id));
 
-    const Block *last = current_loan_status(pool, chain, book_id);
+    const LendingRecord *last = current_loan_status(pool, chain, book_id);
     if (last == NULL || strcmp(last->action, ACTION_BORROWED) != 0) {
         printf("ERROR: No active loan found for book ID '%s'\n", book_id);
         return;
     }
 
-    time_t now = time(NULL);
-    double elapsed = difftime(now, last->timestamp);
-    int reward = (elapsed <= LOAN_PERIOD_SECONDS) ? REWARD_ON_TIME : REWARD_LATE;
+    LendingRecord rec = {0};
+    rec.record_id = next_record_id(chain, pool);
+    strncpy(rec.book_id, last->book_id, sizeof(rec.book_id) - 1);
+    strncpy(rec.copy_id, last->copy_id, sizeof(rec.copy_id) - 1);
+    strncpy(rec.book_title, last->book_title, sizeof(rec.book_title) - 1);
+    strncpy(rec.member_id, last->member_id, sizeof(rec.member_id) - 1);
+    strncpy(rec.member_name, last->member_name, sizeof(rec.member_name) - 1);
+    strncpy(rec.action, ACTION_RETURNED, sizeof(rec.action) - 1);
+    rec.timestamp = time(NULL);
+    rec.due_date = last->due_date;
+    rec.fine_amount = 0;
+    rec.nonce = 0;
 
-    char txid[HASH_HEX_LEN];
-    crypto_compute_transaction_id("SYSTEM", last->member_id, reward, now, txid);
-
-    Block pending;
-    if (!blockchain_create_pending_block(&pending, pkey, last->book_id, last->book_title,
-                                          last->member_id, last->member_name, ACTION_RETURNED,
-                                          reward, txid)) {
-        printf("ERROR: Failed to record return transaction\n");
+    if (!blockchain_sign_record(&rec, pkey)) {
+        printf("ERROR: Failed to sign return request\n");
         return;
     }
 
-    pending_pool_add(pool, &pending);
+    pending_pool_add(pool, &rec);
     storage_save_pending_pool(pool, POOL_FILE);
-    printf("OK: '%s' return by %s added to the pending pool - awaiting mining (%s, +%d coins once confirmed).\n",
+    printf("OK: '%s' return by %s added to the pending pool - awaiting mining (%s, reward decided on confirmation).\n",
            last->book_title, last->member_name,
-           elapsed <= LOAN_PERIOD_SECONDS ? "on-time" : "late", reward);
+           rec.timestamp <= last->due_date ? "on-time" : "late");
 }
 
 static void save_ledgers(TransactionModel model, UTXOSet *utxos, AccountLedger *accounts) {
@@ -368,8 +388,12 @@ static void handle_account_credit_test(AccountLedger *ledger) {
 }
 
 static void handle_tamper_demo(Blockchain *chain) {
-    if (chain->count <= 1) {
-        printf("No lending blocks yet to tamper with (only the genesis block exists).\n");
+    int tamperable = 0;
+    for (int i = 1; i < chain->count; i++) {
+        if (chain->blocks[i].record_count > 0) tamperable = 1;
+    }
+    if (!tamperable) {
+        printf("No lending records yet to tamper with (only the genesis block exists).\n");
         return;
     }
 
@@ -378,16 +402,17 @@ static void handle_tamper_demo(Blockchain *chain) {
     read_line(input, sizeof(input));
     int idx = atoi(input);
 
-    if (idx < 1 || idx >= chain->count) {
+    if (idx < 1 || idx >= chain->count || chain->blocks[idx].record_count == 0) {
         printf("ERROR: Invalid block index\n");
         return;
     }
 
     Block *b = &chain->blocks[idx];
-    printf("Tampering with block %d: book_title '%s' -> 'TAMPERED RECORD' (without re-signing)\n",
-           idx, b->book_title);
-    strncpy(b->book_title, "TAMPERED RECORD", sizeof(b->book_title) - 1);
-    b->book_title[sizeof(b->book_title) - 1] = '\0';
+    LendingRecord *rec = &b->records[0];
+    printf("Tampering with block %d, record 0: book_title '%s' -> 'TAMPERED RECORD' (without re-signing, hash/merkle root left stale)\n",
+           idx, rec->book_title);
+    strncpy(rec->book_title, "TAMPERED RECORD", sizeof(rec->book_title) - 1);
+    rec->book_title[sizeof(rec->book_title) - 1] = '\0';
 
     storage_save_chain(chain, CHAIN_FILE);
     printf("Block %d modified in memory and on disk. Run 'Validate Chain' to see it detected.\n", idx);
@@ -440,7 +465,7 @@ int main(int argc, char *argv[]) {
     blockchain_init(&chain);
     if (!storage_load_chain(&chain, CHAIN_FILE)) {
         printf("No existing chain found — creating genesis block.\n");
-        blockchain_add_genesis(&chain, pkey);
+        blockchain_add_genesis(&chain);
         storage_save_chain(&chain, CHAIN_FILE);
     } else {
         printf("Loaded existing chain with %d block(s).\n", chain.count);
@@ -449,7 +474,7 @@ int main(int argc, char *argv[]) {
     PendingPool pool;
     pending_pool_init(&pool);
     if (storage_load_pending_pool(&pool, POOL_FILE) && pool.count > 0) {
-        printf("Loaded %d pending block(s) from a previous session.\n", pool.count);
+        printf("Loaded %d pending record(s) from a previous session.\n", pool.count);
     }
 
     UTXOSet utxos;

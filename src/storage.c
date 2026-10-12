@@ -73,10 +73,10 @@ int storage_load_pending_pool(PendingPool *pool, const char *path) {
 
     if (count > pool->capacity) {
         pool->capacity = count > 0 ? count : 1;
-        pool->entries = realloc(pool->entries, sizeof(Block) * (size_t)pool->capacity);
+        pool->entries = realloc(pool->entries, sizeof(LendingRecord) * (size_t)pool->capacity);
     }
 
-    if (count > 0 && fread(pool->entries, sizeof(Block), (size_t)count, fp) != (size_t)count) {
+    if (count > 0 && fread(pool->entries, sizeof(LendingRecord), (size_t)count, fp) != (size_t)count) {
         fprintf(stderr, "ERROR: Pending pool file '%s' is corrupted (truncated data)\n", path);
         fclose(fp);
         pool->count = 0;
@@ -97,7 +97,7 @@ int storage_save_pending_pool(const PendingPool *pool, const char *path) {
 
     int ok = fwrite(&pool->count, sizeof(int), 1, fp) == 1;
     if (ok && pool->count > 0) {
-        ok = fwrite(pool->entries, sizeof(Block), (size_t)pool->count, fp) == (size_t)pool->count;
+        ok = fwrite(pool->entries, sizeof(LendingRecord), (size_t)pool->count, fp) == (size_t)pool->count;
     }
 
     fclose(fp);

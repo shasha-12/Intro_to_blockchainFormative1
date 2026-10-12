@@ -5,6 +5,8 @@
 #include "mining.h"
 
 #define NETWORK_ACCOUNT "NETWORK"
+#define REWARD_ON_TIME 10
+#define REWARD_LATE 5
 
 static int hash_meets_difficulty(const char *hash_hex, int difficulty) {
     for (int i = 0; i < difficulty; i++) {
@@ -13,9 +15,6 @@ static int hash_meets_difficulty(const char *hash_hex, int difficulty) {
     return 1;
 }
 
-/* Proof-of-work: repeatedly bump the nonce and rehash until the block's
- * hash starts with `difficulty` zero hex characters. Returns how many
- * attempts it took (always at least 1). */
 static unsigned long mine_block(Block *b, int difficulty) {
     unsigned long attempts = 0;
     b->nonce = 0;
@@ -28,34 +27,44 @@ static unsigned long mine_block(Block *b, int difficulty) {
     return attempts;
 }
 
-/* Pops the oldest pending entry, assigns it a real chain position, mines
- * it, and appends it to the chain. Shared by all three mining modes -
- * they only differ in how the resulting mining reward is distributed. */
-static Block confirm_one_pending(Blockchain *chain, PendingPool *pool,
-                                  int difficulty, unsigned long *out_attempts) {
-    Block b = pool->entries[0];
-    b.index = chain->count;
-    strncpy(b.previous_hash, chain->blocks[chain->count - 1].hash, sizeof(b.previous_hash) - 1);
-    b.previous_hash[sizeof(b.previous_hash) - 1] = '\0';
-
-    *out_attempts = mine_block(&b, difficulty);
-
-    blockchain_append_confirmed(chain, &b);
-    pending_pool_remove_at(pool, 0);
-    return b;
+/* A RETURNED record doesn't carry its own reward amount - it's derived
+ * deterministically from the matching BORROWED record's due_date versus
+ * this record's own timestamp, so the reward is always a function of
+ * on-chain history rather than a separately trusted value. The match may
+ * be sitting earlier in the same batch (not yet on the chain) or already
+ * confirmed, so both are checked. */
+static int find_due_date_for_copy(const Blockchain *chain, const LendingRecord *batch,
+                                   int batch_pos, const char *copy_id, time_t *out_due_date) {
+    for (int i = batch_pos - 1; i >= 0; i--) {
+        if (strcmp(batch[i].copy_id, copy_id) == 0 && strcmp(batch[i].action, ACTION_BORROWED) == 0) {
+            *out_due_date = batch[i].due_date;
+            return 1;
+        }
+    }
+    const LendingRecord *last = blockchain_last_action_for_copy(chain, copy_id);
+    if (last != NULL && strcmp(last->action, ACTION_BORROWED) == 0) {
+        *out_due_date = last->due_date;
+        return 1;
+    }
+    return 0;
 }
 
-/* A confirmed RETURNED block may carry a token_reward (10 on-time, 5
- * late, 0/none otherwise) determined back when the block was created.
- * This is what actually pays it out, through whichever ledger model is
- * active for the session. */
-static void credit_member_reward(const Block *b, TransactionModel model,
-                                  UTXOSet *utxos, AccountLedger *accounts) {
-    if (b->token_reward <= 0) return;
+static int determine_return_reward(const Blockchain *chain, const LendingRecord *batch,
+                                    int batch_pos) {
+    time_t due_date;
+    if (!find_due_date_for_copy(chain, batch, batch_pos, batch[batch_pos].copy_id, &due_date)) {
+        return 0;
+    }
+    return (batch[batch_pos].timestamp <= due_date) ? REWARD_ON_TIME : REWARD_LATE;
+}
+
+static void credit_member_reward(const char *member_id, int amount, const char *txid,
+                                  TransactionModel model, UTXOSet *utxos, AccountLedger *accounts) {
+    if (amount <= 0) return;
     if (model == MODEL_UTXO) {
-        utxo_mint(utxos, b->member_id, b->token_reward, NETWORK_ACCOUNT, b->transaction_id);
+        utxo_mint(utxos, member_id, amount, NETWORK_ACCOUNT, txid);
     } else {
-        account_credit_reward(accounts, b->member_id, b->token_reward, NETWORK_ACCOUNT);
+        account_credit_reward(accounts, member_id, amount, NETWORK_ACCOUNT);
     }
 }
 
@@ -71,6 +80,54 @@ static void credit_miner_amount(const char *miner_id, int amount, TransactionMod
     }
 }
 
+/* Pops up to MAX_RECORDS_PER_BLOCK pending entries (oldest first), seals
+ * them into one block with a real merkle root, mines it, and credits any
+ * RETURNED records' rewards. This is the shared confirmation step behind
+ * all three mining modes - they only differ in how the resulting block
+ * reward is distributed afterward. */
+static Block confirm_batch(Blockchain *chain, PendingPool *pool, int difficulty,
+                            TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
+                            unsigned long *out_attempts) {
+    int batch_count = pool->count < MAX_RECORDS_PER_BLOCK ? pool->count : MAX_RECORDS_PER_BLOCK;
+    LendingRecord batch[MAX_RECORDS_PER_BLOCK];
+    for (int i = 0; i < batch_count; i++) {
+        batch[i] = pool->entries[i];
+    }
+
+    int total_reward = 0;
+    for (int i = 0; i < batch_count; i++) {
+        if (strcmp(batch[i].action, ACTION_RETURNED) == 0) {
+            total_reward += determine_return_reward(chain, batch, i);
+        }
+    }
+
+    Block b;
+    blockchain_seal_block(&b, batch, batch_count, chain->count,
+                           chain->blocks[chain->count - 1].hash, "MINER");
+    b.token_reward = total_reward;
+    if (total_reward > 0) {
+        crypto_compute_transaction_id("SYSTEM", "BLOCK_REWARD", total_reward, b.timestamp, b.transaction_id);
+    }
+
+    *out_attempts = mine_block(&b, difficulty);
+    blockchain_append_confirmed(chain, &b);
+
+    for (int i = 0; i < batch_count; i++) {
+        if (strcmp(batch[i].action, ACTION_RETURNED) == 0) {
+            int reward = determine_return_reward(chain, batch, i);
+            if (reward > 0) {
+                credit_member_reward(batch[i].member_id, reward, b.transaction_id, model, utxos, accounts);
+            }
+        }
+    }
+
+    for (int i = 0; i < batch_count; i++) {
+        pending_pool_remove_at(pool, 0);
+    }
+
+    return b;
+}
+
 int mining_solo(Blockchain *chain, PendingPool *pool, int difficulty, const char *miner_id,
                  TransactionModel model, UTXOSet *utxos, AccountLedger *accounts) {
     if (pool->count == 0) {
@@ -78,36 +135,34 @@ int mining_solo(Blockchain *chain, PendingPool *pool, int difficulty, const char
         return 0;
     }
 
-    printf("Mining %d pending block(s) at difficulty %d (miner: %s)...\n",
+    printf("Mining %d pending record(s) at difficulty %d (miner: %s)...\n",
            pool->count, difficulty, miner_id);
 
-    int confirmed = 0;
+    int blocks_confirmed = 0;
     unsigned long total_attempts = 0;
 
     while (pool->count > 0) {
         unsigned long attempts;
-        Block b = confirm_one_pending(chain, pool, difficulty, &attempts);
+        Block b = confirm_batch(chain, pool, difficulty, model, utxos, accounts, &attempts);
         total_attempts += attempts;
-        confirmed++;
+        blocks_confirmed++;
 
-        credit_member_reward(&b, model, utxos, accounts);
-
-        printf("  Confirmed block %d [%s] %s (%s) - %lu hash attempt(s), hash %.12s...",
-               b.index, b.action, b.book_title, b.book_id, attempts, b.hash);
+        printf("  Sealed block %d with %d record(s) - %lu hash attempt(s), hash %.12s...",
+               b.index, b.record_count, attempts, b.hash);
         if (b.token_reward > 0) {
-            printf(" (+%d coins to %s)", b.token_reward, b.member_id);
+            printf(" (+%d coins in returns)", b.token_reward);
         }
         printf("\n");
     }
 
-    int reward = MINING_BLOCK_REWARD * confirmed;
+    int reward = MINING_BLOCK_REWARD * blocks_confirmed;
     credit_miner_amount(miner_id, reward, model, utxos, accounts);
 
     printf("Mining complete: %d block(s) confirmed, %lu total hash attempt(s).\n",
-           confirmed, total_attempts);
+           blocks_confirmed, total_attempts);
     printf("Miner '%s' credited %d coins in block rewards.\n", miner_id, reward);
 
-    return confirmed;
+    return blocks_confirmed;
 }
 
 int mining_pool(Blockchain *chain, PendingPool *pool, int difficulty, int num_miners,
@@ -120,32 +175,25 @@ int mining_pool(Blockchain *chain, PendingPool *pool, int difficulty, int num_mi
     if (num_miners < 1) num_miners = 1;
     if (num_miners > MAX_POOL_MINERS) num_miners = MAX_POOL_MINERS;
 
-    printf("Pool mining %d pending block(s) at difficulty %d with %d miner(s)...\n",
+    printf("Pool mining %d pending record(s) at difficulty %d with %d miner(s)...\n",
            pool->count, difficulty, num_miners);
 
-    int confirmed = 0;
+    int blocks_confirmed = 0;
     unsigned long total_attempts = 0;
 
     while (pool->count > 0) {
         unsigned long attempts;
-        Block b = confirm_one_pending(chain, pool, difficulty, &attempts);
+        Block b = confirm_batch(chain, pool, difficulty, model, utxos, accounts, &attempts);
         total_attempts += attempts;
-        confirmed++;
-
-        credit_member_reward(&b, model, utxos, accounts);
-
-        printf("  Confirmed block %d [%s] %s (%s) - %lu hash attempt(s)\n",
-               b.index, b.action, b.book_title, b.book_id, attempts);
+        blocks_confirmed++;
+        printf("  Sealed block %d with %d record(s) - %lu hash attempt(s)\n",
+               b.index, b.record_count, attempts);
     }
 
-    int block_reward_total = MINING_BLOCK_REWARD * confirmed;
+    int block_reward_total = MINING_BLOCK_REWARD * blocks_confirmed;
     int pool_fee = (block_reward_total * POOL_FEE_PERCENT) / 100;
     int distributable = block_reward_total - pool_fee;
 
-    /* Assign each simulated miner a random weight, then split the real
-     * total_attempts proportionally - the last miner absorbs whatever
-     * rounding remainder is left so the shares always sum exactly to
-     * total_attempts. */
     int weights[MAX_POOL_MINERS];
     int weight_sum = 0;
     for (int i = 0; i < num_miners; i++) {
@@ -179,7 +227,7 @@ int mining_pool(Blockchain *chain, PendingPool *pool, int difficulty, int num_mi
     }
 
     printf("Pool mining complete: %d block(s) confirmed, %lu total hash attempt(s).\n",
-           confirmed, total_attempts);
+           blocks_confirmed, total_attempts);
     printf("Block reward pool: %d coins, pool fee (%d%%): %d coins, distributed: %d coins\n",
            block_reward_total, POOL_FEE_PERCENT, pool_fee, distributable);
     printf("-------------------------- POOL MINING RESULTS --------------------------\n");
@@ -191,7 +239,7 @@ int mining_pool(Blockchain *chain, PendingPool *pool, int difficulty, int num_mi
     }
     printf("---------------------------------------------------------------------------\n");
 
-    return confirmed;
+    return blocks_confirmed;
 }
 
 void mining_cloud(Blockchain *chain, PendingPool *pool, int difficulty, int rounds,
@@ -206,19 +254,14 @@ void mining_cloud(Blockchain *chain, PendingPool *pool, int difficulty, int roun
     int cumulative_reward = 0;
 
     for (int r = 0; r < rounds; r++) {
-        /* Whatever's pending gets confirmed each round, same as solo
-         * mining - renting hash power still gets your blocks mined, you
-         * just aren't the one doing the PoW search yourself. */
         while (pool->count > 0) {
             unsigned long attempts;
-            Block b = confirm_one_pending(chain, pool, difficulty, &attempts);
-            credit_member_reward(&b, model, utxos, accounts);
-            printf("  [round %d] confirmed block %d [%s] %s (%s)\n",
-                   r + 1, b.index, b.action, b.book_title, b.book_id);
+            Block b = confirm_batch(chain, pool, difficulty, model, utxos, accounts, &attempts);
+            printf("  [round %d] sealed block %d with %d record(s)\n", r + 1, b.index, b.record_count);
         }
 
         int fee = CLOUD_RENTAL_FEE;
-        int reward = rand() % 31; /* 0-30, so some rounds land below the fee on purpose */
+        int reward = rand() % 31;
 
         cumulative_fee += fee;
         cumulative_reward += reward;
