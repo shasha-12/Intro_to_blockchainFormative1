@@ -1,4 +1,10 @@
 *.o
 library_tracker
 chain.dat
+pending_pool.dat
+utxo_set.dat
+account_ledger.dat
+copy_inventory.dat
+reservation_queue.dat
+fine_ledger.dat
 keys/*.pem

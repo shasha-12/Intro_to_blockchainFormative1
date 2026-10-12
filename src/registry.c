@@ -22,6 +22,10 @@ static int split_csv(char *line, char fields[][80], int field_size, int max_fiel
     return count;
 }
 
+/* Registries are the trust boundary for the whole program: every borrow or
+ * return checks its book/member ID against what got loaded here, so a
+ * malformed line is skipped with a warning rather than silently accepted
+ * or crashing the loader. */
 static int load_books(Registry *reg, const char *path) {
     FILE *fp = fopen(path, "r");
     if (fp == NULL) {
