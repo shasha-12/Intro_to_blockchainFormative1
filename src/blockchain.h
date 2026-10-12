@@ -4,6 +4,7 @@
 #include <time.h>
 #include <openssl/evp.h>
 #include "crypto.h"
+#include "member_keys.h"
 
 #define ACTION_BORROWED "BORROWED"
 #define ACTION_RETURNED "RETURNED"
@@ -82,8 +83,13 @@ void blockchain_recompute_hash(const Block *b, char out_hex[HASH_HEX_LEN]);
  * history yet. */
 const LendingRecord *blockchain_last_action_for_copy(const Blockchain *chain, const char *copy_id);
 
-int blockchain_validate(const Blockchain *chain, EVP_PKEY *pkey);
+/* Verifies every block's hash, previous-hash link, and merkle root as
+ * before, plus each record's signature against its own signer's public
+ * key (looked up by member_id in keys) rather than one shared key - a
+ * record forged under a different member's name fails verification even
+ * if every field otherwise looks plausible. */
+int blockchain_validate(const Blockchain *chain, MemberKeyStore *keys);
 
-void blockchain_print_records(const Blockchain *chain, EVP_PKEY *pkey);
+void blockchain_print_records(const Blockchain *chain, MemberKeyStore *keys);
 
 #endif

@@ -5,6 +5,8 @@
 #include "registry.h"
 #include "crypto.h"
 #include "blockchain.h"
+#include "member_keys.h"
+#include "nonce_registry.h"
 #include "inventory.h"
 #include "fines.h"
 #include "pending_pool.h"
@@ -23,9 +25,8 @@
 #define COPY_STATE_FILE "copy_inventory.dat"
 #define RESERVATION_FILE "reservation_queue.dat"
 #define FINE_FILE "fine_ledger.dat"
+#define NONCE_FILE "nonce_registry.dat"
 #define NETWORK_ACCOUNT "NETWORK"
-#define PRIV_KEY_FILE "keys/private.pem"
-#define PUB_KEY_FILE "keys/public.pem"
 
 /* A book borrowed now is due this many seconds later, and each renewal
  * extends it by the same window - a real loan period would be measured
@@ -79,12 +80,13 @@ static void split_command(char *line, char **cmd, char **arg) {
 static void print_commands(int difficulty, TransactionModel model) {
     printf("\n===== Library Lending Tracker ===== [model: %s, difficulty: %d]\n",
            model_name(model), difficulty);
+    printf("Membership:   register_member  view_member  member_nonce\n");
     printf("Book/Copy:    register_book  view_book  add_copy  view_copy  mark_lost\n");
     printf("Lending:      borrow_book  return_book  renew_book  reserve_book  reservation_status\n");
     printf("Fines:        check_overdue  view_fines  settle_fine\n");
     printf("Pool/Mining:  pool_view  mine_solo  mine_pool  mine_cloud <rounds>\n");
     printf("              difficulty_status  set_difficulty\n");
-    printf("Chain:        chain_view  validate_chain  chain_save  chain_load  tamper_block\n");
+    printf("Chain:        chain_view  validate_chain  chain_save  chain_load  tamper_block  replay_test\n");
     printf("Tokens:       utxo_view  token_transfer  token_balance  credit_test_utxo\n");
     printf("              account_balance  account_transfer  account_nonce\n");
     printf("              transaction_history <member_id>  credit_test_account\n");
@@ -114,9 +116,83 @@ static unsigned long next_record_id(const Blockchain *chain, const PendingPool *
     return count + 1;
 }
 
+/* The registry's nonce only ever advances on confirmation, so using it
+ * directly for every new request would hand out the same nonce to a
+ * member's second action if their first is still unconfirmed. A new
+ * request's nonce is instead the confirmed nonce plus however many of
+ * that member's requests are already queued ahead of it in the pool -
+ * the same "confirmed nonce + pending count" tracking a real wallet
+ * does locally, so sequential actions from one member don't collide
+ * with each other while the authoritative confirmed value still only
+ * moves at mining time. */
+static unsigned long next_assignable_nonce(const PendingPool *pool, NonceRegistry *nonces,
+                                            const char *member_id) {
+    unsigned long n = nonce_registry_get(nonces, member_id);
+    for (int i = 0; i < pool->count; i++) {
+        if (strcmp(pool->entries[i].member_id, member_id) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
 static void save_inventory_state(const CopyInventory *inv, const ReservationQueue *q) {
     storage_save_copy_inventory(inv, COPY_STATE_FILE);
     storage_save_reservation_queue(q, RESERVATION_FILE);
+}
+
+static void handle_register_member(Registry *reg, MemberKeyStore *keys) {
+    char member_id[20], full_name[50], course_code[10];
+    printf("Member ID: ");
+    read_line(member_id, sizeof(member_id));
+    printf("Full Name: ");
+    read_line(full_name, sizeof(full_name));
+    printf("Course Code: ");
+    read_line(course_code, sizeof(course_code));
+
+    if (registry_find_member(reg, member_id) != NULL) {
+        printf("ERROR: Member ID '%s' already exists\n", member_id);
+        return;
+    }
+    if (reg->member_count >= MAX_MEMBERS) {
+        printf("ERROR: Member registry is full\n");
+        return;
+    }
+
+    Member *m = &reg->members[reg->member_count];
+    strncpy(m->member_id, member_id, sizeof(m->member_id) - 1);
+    strncpy(m->full_name, full_name, sizeof(m->full_name) - 1);
+    strncpy(m->course_code, course_code, sizeof(m->course_code) - 1);
+    reg->member_count++;
+
+    /* Generating the keypair immediately (rather than waiting for their
+     * first request) means a brand new member already has an on-chain
+     * identity the moment they're registered. */
+    if (member_key_store_get(keys, member_id) == NULL) {
+        printf("WARNING: Member registered, but keypair generation failed\n");
+        return;
+    }
+    printf("OK: Registered %s (%s), course %s, with a new signing keypair\n",
+           full_name, member_id, course_code);
+}
+
+static void handle_view_member(const Registry *reg) {
+    char member_id[20];
+    printf("Member ID: ");
+    read_line(member_id, sizeof(member_id));
+    const Member *m = registry_find_member(reg, member_id);
+    if (m == NULL) {
+        printf("ERROR: Member '%s' not found\n", member_id);
+        return;
+    }
+    printf("  %s: %s, course %s\n", m->member_id, m->full_name, m->course_code);
+}
+
+static void handle_member_nonce(NonceRegistry *nonces) {
+    char member_id[20];
+    printf("Member ID: ");
+    read_line(member_id, sizeof(member_id));
+    printf("  %s: confirmed nonce %lu\n", member_id, nonce_registry_get(nonces, member_id));
 }
 
 static void handle_register_book(Registry *reg) {
@@ -245,7 +321,8 @@ static void handle_mark_lost(CopyInventory *inv, ReservationQueue *q, const char
 }
 
 static void handle_borrow(PendingPool *pool, const Blockchain *chain, const Registry *reg,
-                           CopyInventory *inv, ReservationQueue *reservations, EVP_PKEY *pkey) {
+                           CopyInventory *inv, ReservationQueue *reservations,
+                           MemberKeyStore *keys, NonceRegistry *nonces) {
     char book_id[20], member_id[20];
 
     printf("Enter Book ID: ");
@@ -283,9 +360,9 @@ static void handle_borrow(PendingPool *pool, const Blockchain *chain, const Regi
     rec.timestamp = time(NULL);
     rec.due_date = rec.timestamp + LOAN_PERIOD_SECONDS;
     rec.fine_amount = 0;
-    rec.nonce = 0;
+    rec.nonce = next_assignable_nonce(pool, nonces, member->member_id);
 
-    if (!blockchain_sign_record(&rec, pkey)) {
+    if (!blockchain_sign_record(&rec, member_key_store_get(keys, member->member_id))) {
         printf("ERROR: Failed to sign borrow request\n");
         return;
     }
@@ -304,8 +381,8 @@ static void handle_borrow(PendingPool *pool, const Blockchain *chain, const Regi
            book->title, copy->copy_id, member->full_name);
 }
 
-static void handle_return(PendingPool *pool, const Blockchain *chain,
-                           CopyInventory *inv, ReservationQueue *reservations, EVP_PKEY *pkey) {
+static void handle_return(PendingPool *pool, const Blockchain *chain, CopyInventory *inv,
+                           ReservationQueue *reservations, MemberKeyStore *keys, NonceRegistry *nonces) {
     char copy_id[20];
     printf("Enter Copy ID: ");
     read_line(copy_id, sizeof(copy_id));
@@ -335,7 +412,7 @@ static void handle_return(PendingPool *pool, const Blockchain *chain,
     strncpy(rec.action, ACTION_RETURNED, sizeof(rec.action) - 1);
     rec.timestamp = time(NULL);
     rec.due_date = last->due_date;
-    rec.nonce = 0;
+    rec.nonce = next_assignable_nonce(pool, nonces, last->member_id);
 
     /* A late return gets both a reduced token reward (handled at mining
      * time) and a fine, calculated per simulated day late - rounding up,
@@ -348,7 +425,7 @@ static void handle_return(PendingPool *pool, const Blockchain *chain,
         rec.fine_amount = 0;
     }
 
-    if (!blockchain_sign_record(&rec, pkey)) {
+    if (!blockchain_sign_record(&rec, member_key_store_get(keys, last->member_id))) {
         printf("ERROR: Failed to sign return request\n");
         return;
     }
@@ -385,7 +462,7 @@ static void handle_return(PendingPool *pool, const Blockchain *chain,
 }
 
 static void handle_renew_book(PendingPool *pool, const Blockchain *chain, CopyInventory *inv,
-                               ReservationQueue *reservations, EVP_PKEY *pkey) {
+                               ReservationQueue *reservations, MemberKeyStore *keys, NonceRegistry *nonces) {
     char copy_id[20];
     printf("Enter Copy ID: ");
     read_line(copy_id, sizeof(copy_id));
@@ -421,9 +498,9 @@ static void handle_renew_book(PendingPool *pool, const Blockchain *chain, CopyIn
     rec.timestamp = time(NULL);
     rec.due_date = last->due_date + RENEWAL_PERIOD_SECONDS;
     rec.fine_amount = 0;
-    rec.nonce = 0;
+    rec.nonce = next_assignable_nonce(pool, nonces, last->member_id);
 
-    if (!blockchain_sign_record(&rec, pkey)) {
+    if (!blockchain_sign_record(&rec, member_key_store_get(keys, last->member_id))) {
         printf("ERROR: Failed to sign renewal request\n");
         return;
     }
@@ -471,8 +548,8 @@ static void handle_reservation_status(const ReservationQueue *reservations) {
  * was first flagged. Re-signing after mutating a pending record is
  * required: the signature covers fine_amount and timestamp, both of
  * which just changed. */
-static void handle_check_overdue(PendingPool *pool, const Blockchain *chain,
-                                  CopyInventory *inv, EVP_PKEY *pkey) {
+static void handle_check_overdue(PendingPool *pool, const Blockchain *chain, CopyInventory *inv,
+                                  MemberKeyStore *keys, NonceRegistry *nonces) {
     time_t now = time(NULL);
     int flagged = 0;
 
@@ -498,7 +575,7 @@ static void handle_check_overdue(PendingPool *pool, const Blockchain *chain,
             if (fine != existing->fine_amount) {
                 existing->fine_amount = fine;
                 existing->timestamp = now;
-                blockchain_sign_record(existing, pkey);
+                blockchain_sign_record(existing, member_key_store_get(keys, existing->member_id));
                 flagged++;
             }
             continue;
@@ -521,9 +598,9 @@ static void handle_check_overdue(PendingPool *pool, const Blockchain *chain,
         rec.timestamp = now;
         rec.due_date = c->due_date;
         rec.fine_amount = fine;
-        rec.nonce = 0;
+        rec.nonce = next_assignable_nonce(pool, nonces, c->current_holder_id);
 
-        if (blockchain_sign_record(&rec, pkey)) {
+        if (blockchain_sign_record(&rec, member_key_store_get(keys, c->current_holder_id))) {
             pending_pool_add(pool, &rec);
             flagged++;
         }
@@ -580,7 +657,7 @@ static void print_ledger_state(TransactionModel model, UTXOSet *utxos, AccountLe
 
 static void handle_mine_solo(Blockchain *chain, PendingPool *pool, int difficulty,
                               TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
-                              FineLedger *fines) {
+                              FineLedger *fines, NonceRegistry *nonces) {
     char miner_id[50];
     printf("Enter Miner ID: ");
     read_line(miner_id, sizeof(miner_id));
@@ -588,36 +665,38 @@ static void handle_mine_solo(Blockchain *chain, PendingPool *pool, int difficult
         strcpy(miner_id, "MINER1");
     }
 
-    mining_solo(chain, pool, difficulty, miner_id, model, utxos, accounts, fines);
+    mining_solo(chain, pool, difficulty, miner_id, model, utxos, accounts, fines, nonces);
 
     storage_save_chain(chain, CHAIN_FILE);
     storage_save_pending_pool(pool, POOL_FILE);
     save_ledgers(model, utxos, accounts);
     storage_save_fine_ledger(fines, FINE_FILE);
+    storage_save_nonce_registry(nonces, NONCE_FILE);
     print_ledger_state(model, utxos, accounts);
 }
 
 static void handle_mine_pool(Blockchain *chain, PendingPool *pool, int difficulty,
                               TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
-                              FineLedger *fines) {
+                              FineLedger *fines, NonceRegistry *nonces) {
     char input[16];
     printf("Number of pool miners (%d-%d, default %d): ", 1, MAX_POOL_MINERS, DEFAULT_POOL_MINERS);
     read_line(input, sizeof(input));
     int num_miners = input[0] == '\0' ? DEFAULT_POOL_MINERS : atoi(input);
 
     PoolMinerResult results[MAX_POOL_MINERS];
-    mining_pool(chain, pool, difficulty, num_miners, model, utxos, accounts, fines, results);
+    mining_pool(chain, pool, difficulty, num_miners, model, utxos, accounts, fines, nonces, results);
 
     storage_save_chain(chain, CHAIN_FILE);
     storage_save_pending_pool(pool, POOL_FILE);
     save_ledgers(model, utxos, accounts);
     storage_save_fine_ledger(fines, FINE_FILE);
+    storage_save_nonce_registry(nonces, NONCE_FILE);
     print_ledger_state(model, utxos, accounts);
 }
 
 static void handle_mine_cloud(Blockchain *chain, PendingPool *pool, int difficulty,
                                TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
-                               FineLedger *fines, const char *arg) {
+                               FineLedger *fines, NonceRegistry *nonces, const char *arg) {
     char renter_id[50], input[16];
     printf("Enter Renter ID: ");
     read_line(renter_id, sizeof(renter_id));
@@ -635,12 +714,13 @@ static void handle_mine_cloud(Blockchain *chain, PendingPool *pool, int difficul
     }
 
     CloudRound rounds_out[MAX_CLOUD_ROUNDS];
-    mining_cloud(chain, pool, difficulty, rounds, renter_id, model, utxos, accounts, fines, rounds_out);
+    mining_cloud(chain, pool, difficulty, rounds, renter_id, model, utxos, accounts, fines, nonces, rounds_out);
 
     storage_save_chain(chain, CHAIN_FILE);
     storage_save_pending_pool(pool, POOL_FILE);
     save_ledgers(model, utxos, accounts);
     storage_save_fine_ledger(fines, FINE_FILE);
+    storage_save_nonce_registry(nonces, NONCE_FILE);
     print_ledger_state(model, utxos, accounts);
 }
 
@@ -794,6 +874,38 @@ static void handle_account_credit_test(AccountLedger *ledger) {
            amount, member_id, ACCOUNT_FEE, NETWORK_ACCOUNT);
 }
 
+/* A dev/test hook, same purpose as credit_test_utxo/credit_test_account:
+ * nonce rejection is designed to never trigger during normal legitimate
+ * use (next_assignable_nonce already prevents a member's own requests
+ * from colliding), so the only way to actually show it happening is to
+ * simulate what an attacker would do - replay an already-confirmed,
+ * genuinely validly-signed record back into the pool with its now-stale
+ * nonce. The signature still verifies fine (nothing about the record
+ * itself changed), which is exactly why the nonce check, not the
+ * signature check, is what has to catch this. */
+static void handle_replay_test(PendingPool *pool, const Blockchain *chain, const char *arg) {
+    char copy_id[20];
+    if (arg != NULL) {
+        strncpy(copy_id, arg, sizeof(copy_id) - 1);
+        copy_id[sizeof(copy_id) - 1] = '\0';
+    } else {
+        printf("Copy ID (of an already-confirmed record): ");
+        read_line(copy_id, sizeof(copy_id));
+    }
+
+    const LendingRecord *last = blockchain_last_action_for_copy(chain, copy_id);
+    if (last == NULL) {
+        printf("ERROR: No confirmed record found for copy '%s'\n", copy_id);
+        return;
+    }
+
+    pending_pool_add(pool, last);
+    storage_save_pending_pool(pool, POOL_FILE);
+    printf("OK: Replayed the confirmed %s record for copy '%s' (member %s, nonce %lu) back into the pool.\n",
+           last->action, copy_id, last->member_id, last->nonce);
+    printf("Run mine_solo/mine_pool/mine_cloud now - it should be rejected, since that nonce is already spent.\n");
+}
+
 static void handle_tamper_demo(Blockchain *chain) {
     int tamperable = 0;
     for (int i = 1; i < chain->count; i++) {
@@ -862,11 +974,16 @@ int main(int argc, char *argv[]) {
     }
     printf("Loaded %d books and %d members.\n", reg.book_count, reg.member_count);
 
-    EVP_PKEY *pkey = NULL;
-    if (!crypto_load_or_generate_keys(PRIV_KEY_FILE, PUB_KEY_FILE, &pkey)) {
-        fprintf(stderr, "FATAL: Could not load or generate signing keys.\n");
-        return 1;
-    }
+    /* Formative 1/2 used one shared librarian keypair to sign everything.
+     * The summative requires every member to have their own identity, so
+     * each member's key is generated lazily, the first time they're
+     * looked up, and reused from keys/members/ on every later run. */
+    MemberKeyStore member_keys;
+    member_key_store_init(&member_keys);
+
+    NonceRegistry nonces;
+    nonce_registry_init(&nonces);
+    storage_load_nonce_registry(&nonces, NONCE_FILE);
 
     Blockchain chain;
     blockchain_init(&chain);
@@ -927,7 +1044,7 @@ int main(int argc, char *argv[]) {
     /* Overdue detection runs automatically on this CLI invocation (i.e.
      * each time the program starts), in addition to being callable
      * on-demand mid-session via check_overdue. */
-    handle_check_overdue(&pool, &chain, &inv, pkey);
+    handle_check_overdue(&pool, &chain, &inv, &member_keys, &nonces);
 
     int running = 1;
     while (running) {
@@ -944,6 +1061,12 @@ int main(int argc, char *argv[]) {
             continue;
         } else if (strcmp(cmd, "help") == 0) {
             continue;
+        } else if (strcmp(cmd, "register_member") == 0) {
+            handle_register_member(&reg, &member_keys);
+        } else if (strcmp(cmd, "view_member") == 0) {
+            handle_view_member(&reg);
+        } else if (strcmp(cmd, "member_nonce") == 0) {
+            handle_member_nonce(&nonces);
         } else if (strcmp(cmd, "register_book") == 0) {
             handle_register_book(&reg);
         } else if (strcmp(cmd, "view_book") == 0) {
@@ -955,17 +1078,17 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(cmd, "mark_lost") == 0) {
             handle_mark_lost(&inv, &reservations, arg);
         } else if (strcmp(cmd, "borrow_book") == 0) {
-            handle_borrow(&pool, &chain, &reg, &inv, &reservations, pkey);
+            handle_borrow(&pool, &chain, &reg, &inv, &reservations, &member_keys, &nonces);
         } else if (strcmp(cmd, "return_book") == 0) {
-            handle_return(&pool, &chain, &inv, &reservations, pkey);
+            handle_return(&pool, &chain, &inv, &reservations, &member_keys, &nonces);
         } else if (strcmp(cmd, "renew_book") == 0) {
-            handle_renew_book(&pool, &chain, &inv, &reservations, pkey);
+            handle_renew_book(&pool, &chain, &inv, &reservations, &member_keys, &nonces);
         } else if (strcmp(cmd, "reserve_book") == 0) {
             handle_reserve_book(&reg, &inv, &reservations);
         } else if (strcmp(cmd, "reservation_status") == 0) {
             handle_reservation_status(&reservations);
         } else if (strcmp(cmd, "check_overdue") == 0) {
-            handle_check_overdue(&pool, &chain, &inv, pkey);
+            handle_check_overdue(&pool, &chain, &inv, &member_keys, &nonces);
         } else if (strcmp(cmd, "view_fines") == 0) {
             handle_view_fines(&fines);
         } else if (strcmp(cmd, "settle_fine") == 0) {
@@ -973,19 +1096,19 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(cmd, "pool_view") == 0) {
             pending_pool_print(&pool);
         } else if (strcmp(cmd, "mine_solo") == 0) {
-            handle_mine_solo(&chain, &pool, difficulty, model, &utxos, &accounts, &fines);
+            handle_mine_solo(&chain, &pool, difficulty, model, &utxos, &accounts, &fines, &nonces);
         } else if (strcmp(cmd, "mine_pool") == 0) {
-            handle_mine_pool(&chain, &pool, difficulty, model, &utxos, &accounts, &fines);
+            handle_mine_pool(&chain, &pool, difficulty, model, &utxos, &accounts, &fines, &nonces);
         } else if (strcmp(cmd, "mine_cloud") == 0) {
-            handle_mine_cloud(&chain, &pool, difficulty, model, &utxos, &accounts, &fines, arg);
+            handle_mine_cloud(&chain, &pool, difficulty, model, &utxos, &accounts, &fines, &nonces, arg);
         } else if (strcmp(cmd, "difficulty_status") == 0) {
             printf("Current mining difficulty: %d (range %d-%d)\n", difficulty, MIN_DIFFICULTY, MAX_DIFFICULTY);
         } else if (strcmp(cmd, "set_difficulty") == 0) {
             difficulty = handle_set_difficulty(difficulty);
         } else if (strcmp(cmd, "chain_view") == 0) {
-            blockchain_print_records(&chain, pkey);
+            blockchain_print_records(&chain, &member_keys);
         } else if (strcmp(cmd, "validate_chain") == 0) {
-            int valid = blockchain_validate(&chain, pkey);
+            int valid = blockchain_validate(&chain, &member_keys);
             printf(valid ? "\nChain is VALID — no tampering detected.\n"
                          : "\nChain is INVALID — tampering detected!\n");
         } else if (strcmp(cmd, "chain_save") == 0) {
@@ -999,6 +1122,8 @@ int main(int argc, char *argv[]) {
             }
         } else if (strcmp(cmd, "tamper_block") == 0) {
             handle_tamper_demo(&chain);
+        } else if (strcmp(cmd, "replay_test") == 0) {
+            handle_replay_test(&pool, &chain, arg);
         } else if (strcmp(cmd, "utxo_view") == 0) {
             utxo_print_set(&utxos);
         } else if (strcmp(cmd, "token_transfer") == 0) {
@@ -1040,6 +1165,8 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    nonce_registry_free(&nonces);
+    member_key_store_free(&member_keys);
     fine_ledger_free(&fines);
     reservation_queue_free(&reservations);
     copy_inventory_free(&inv);
@@ -1047,6 +1174,5 @@ int main(int argc, char *argv[]) {
     utxo_set_free(&utxos);
     pending_pool_free(&pool);
     blockchain_free(&chain);
-    crypto_free_key(pkey);
     return 0;
 }

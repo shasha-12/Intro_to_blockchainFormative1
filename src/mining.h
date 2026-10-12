@@ -6,6 +6,7 @@
 #include "utxo.h"
 #include "account.h"
 #include "fines.h"
+#include "nonce_registry.h"
 
 #define MINING_BLOCK_REWARD 50
 #define MIN_DIFFICULTY 1
@@ -39,7 +40,8 @@ typedef struct {
  * through whichever ledger model is active. The full per-block mining
  * reward goes to miner_id. Returns the number of blocks confirmed. */
 int mining_solo(Blockchain *chain, PendingPool *pool, int difficulty, const char *miner_id,
-                 TransactionModel model, UTXOSet *utxos, AccountLedger *accounts, FineLedger *fines);
+                 TransactionModel model, UTXOSet *utxos, AccountLedger *accounts, FineLedger *fines,
+                 NonceRegistry *nonces);
 
 /* Same underlying confirmation process as mining_solo, but the combined
  * mining reward for everything confirmed in this run (minus a 2% pool
@@ -49,7 +51,7 @@ int mining_solo(Blockchain *chain, PendingPool *pool, int difficulty, const char
  * num_miners long) and returns how many blocks were confirmed. */
 int mining_pool(Blockchain *chain, PendingPool *pool, int difficulty, int num_miners,
                  TransactionModel model, UTXOSet *utxos, AccountLedger *accounts, FineLedger *fines,
-                 PoolMinerResult *out_results);
+                 NonceRegistry *nonces, PoolMinerResult *out_results);
 
 typedef struct {
     int round;
@@ -68,7 +70,7 @@ typedef struct {
  * `rounds` long). Any positive net profit at the end is credited to
  * renter_id through the active ledger model. */
 void mining_cloud(Blockchain *chain, PendingPool *pool, int difficulty, int rounds,
-                   const char *renter_id, TransactionModel model,
-                   UTXOSet *utxos, AccountLedger *accounts, FineLedger *fines, CloudRound *out_rounds);
+                   const char *renter_id, TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
+                   FineLedger *fines, NonceRegistry *nonces, CloudRound *out_rounds);
 
 #endif

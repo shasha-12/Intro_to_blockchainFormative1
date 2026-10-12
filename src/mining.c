@@ -87,18 +87,77 @@ static void credit_miner_amount(const char *miner_id, int amount, TransactionMod
     }
 }
 
-/* Pops up to MAX_RECORDS_PER_BLOCK pending entries (oldest first), seals
- * them into one block with a real merkle root, mines it, and credits any
- * RETURNED records' rewards. This is the shared confirmation step behind
- * all three mining modes - they only differ in how the resulting block
- * reward is distributed afterward. */
-static Block confirm_batch(Blockchain *chain, PendingPool *pool, int difficulty,
-                            TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
-                            FineLedger *fines, unsigned long *out_attempts) {
-    int batch_count = pool->count < MAX_RECORDS_PER_BLOCK ? pool->count : MAX_RECORDS_PER_BLOCK;
+/* Gathers up to MAX_RECORDS_PER_BLOCK candidate records from the front
+ * of the pool, but only accepts ones whose nonce matches the member's
+ * current CONFIRMED nonce - the nonce only actually advances here, on
+ * confirmation, never when a request merely enters the pool. A record
+ * that doesn't match (e.g. two unconfirmed requests from the same
+ * member racing each other, or a genuinely replayed old signed request)
+ * is left behind in the pool rather than silently included. Writes the
+ * indices (into pool->entries) of every accepted record into out_indices
+ * and returns how many were accepted. */
+static int gather_valid_batch(const PendingPool *pool, NonceRegistry *nonces,
+                               LendingRecord *out_batch, int *out_indices) {
+    int accepted = 0;
+    unsigned long projected[MAX_RECORDS_PER_BLOCK];
+    char projected_member[MAX_RECORDS_PER_BLOCK][20];
+    int projected_count = 0;
+
+    for (int i = 0; i < pool->count && accepted < MAX_RECORDS_PER_BLOCK; i++) {
+        const LendingRecord *candidate = &pool->entries[i];
+
+        unsigned long expected = nonce_registry_get(nonces, candidate->member_id);
+        for (int j = 0; j < projected_count; j++) {
+            if (strcmp(projected_member[j], candidate->member_id) == 0) {
+                expected = projected[j];
+            }
+        }
+
+        if (candidate->nonce != expected) {
+            printf("  Rejected pending record for %s - nonce %lu does not match expected %lu (left in pool).\n",
+                   candidate->member_id, candidate->nonce, expected);
+            continue;
+        }
+
+        out_batch[accepted] = *candidate;
+        out_indices[accepted] = i;
+        accepted++;
+
+        int found = 0;
+        for (int j = 0; j < projected_count; j++) {
+            if (strcmp(projected_member[j], candidate->member_id) == 0) {
+                projected[j] = expected + 1;
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            strncpy(projected_member[projected_count], candidate->member_id, 19);
+            projected_member[projected_count][19] = '\0';
+            projected[projected_count] = expected + 1;
+            projected_count++;
+        }
+    }
+
+    return accepted;
+}
+
+/* Seals whatever gather_valid_batch accepts into one block with a real
+ * merkle root, mines it, credits any RETURNED records' rewards and any
+ * accrued fines, and advances each included record's sender's nonce.
+ * This is the shared confirmation step behind all three mining modes -
+ * they only differ in how the resulting block reward is distributed
+ * afterward. Returns 0 (nothing confirmed, out_block untouched) if every
+ * remaining pending record currently fails its nonce check. */
+static int confirm_batch(Blockchain *chain, PendingPool *pool, int difficulty,
+                          TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
+                          FineLedger *fines, NonceRegistry *nonces,
+                          Block *out_block, unsigned long *out_attempts) {
     LendingRecord batch[MAX_RECORDS_PER_BLOCK];
-    for (int i = 0; i < batch_count; i++) {
-        batch[i] = pool->entries[i];
+    int indices[MAX_RECORDS_PER_BLOCK];
+    int batch_count = gather_valid_batch(pool, nonces, batch, indices);
+    if (batch_count == 0) {
+        return 0;
     }
 
     int total_reward = 0;
@@ -131,17 +190,23 @@ static Block confirm_batch(Blockchain *chain, PendingPool *pool, int difficulty,
         if (batch[i].fine_amount > 0) {
             fine_ledger_accrue(fines, batch[i].member_id, batch[i].fine_amount);
         }
+        nonce_registry_increment(nonces, batch[i].member_id);
     }
 
-    for (int i = 0; i < batch_count; i++) {
-        pending_pool_remove_at(pool, 0);
+    /* Remove accepted entries highest-index-first so earlier indices in
+     * `indices` stay valid while removing - some lower-indexed pool
+     * entries may have been skipped (left behind) rather than accepted. */
+    for (int i = batch_count - 1; i >= 0; i--) {
+        pending_pool_remove_at(pool, indices[i]);
     }
 
-    return b;
+    *out_block = b;
+    return 1;
 }
 
 int mining_solo(Blockchain *chain, PendingPool *pool, int difficulty, const char *miner_id,
-                 TransactionModel model, UTXOSet *utxos, AccountLedger *accounts, FineLedger *fines) {
+                 TransactionModel model, UTXOSet *utxos, AccountLedger *accounts, FineLedger *fines,
+                 NonceRegistry *nonces) {
     if (pool->count == 0) {
         printf("Pending pool is empty - nothing to mine.\n");
         return 0;
@@ -154,8 +219,13 @@ int mining_solo(Blockchain *chain, PendingPool *pool, int difficulty, const char
     unsigned long total_attempts = 0;
 
     while (pool->count > 0) {
+        Block b;
         unsigned long attempts;
-        Block b = confirm_batch(chain, pool, difficulty, model, utxos, accounts, fines, &attempts);
+        if (!confirm_batch(chain, pool, difficulty, model, utxos, accounts, fines, nonces, &b, &attempts)) {
+            printf("  %d record(s) left in the pool could not be confirmed this round (nonce mismatch).\n",
+                   pool->count);
+            break;
+        }
         total_attempts += attempts;
         blocks_confirmed++;
 
@@ -179,7 +249,7 @@ int mining_solo(Blockchain *chain, PendingPool *pool, int difficulty, const char
 
 int mining_pool(Blockchain *chain, PendingPool *pool, int difficulty, int num_miners,
                  TransactionModel model, UTXOSet *utxos, AccountLedger *accounts, FineLedger *fines,
-                 PoolMinerResult *out_results) {
+                 NonceRegistry *nonces, PoolMinerResult *out_results) {
     if (pool->count == 0) {
         printf("Pending pool is empty - nothing to mine.\n");
         return 0;
@@ -194,8 +264,13 @@ int mining_pool(Blockchain *chain, PendingPool *pool, int difficulty, int num_mi
     unsigned long total_attempts = 0;
 
     while (pool->count > 0) {
+        Block b;
         unsigned long attempts;
-        Block b = confirm_batch(chain, pool, difficulty, model, utxos, accounts, fines, &attempts);
+        if (!confirm_batch(chain, pool, difficulty, model, utxos, accounts, fines, nonces, &b, &attempts)) {
+            printf("  %d record(s) left in the pool could not be confirmed this round (nonce mismatch).\n",
+                   pool->count);
+            break;
+        }
         total_attempts += attempts;
         blocks_confirmed++;
         printf("  Sealed block %d with %d record(s) - %lu hash attempt(s)\n",
@@ -255,8 +330,8 @@ int mining_pool(Blockchain *chain, PendingPool *pool, int difficulty, int num_mi
 }
 
 void mining_cloud(Blockchain *chain, PendingPool *pool, int difficulty, int rounds,
-                   const char *renter_id, TransactionModel model,
-                   UTXOSet *utxos, AccountLedger *accounts, FineLedger *fines, CloudRound *out_rounds) {
+                   const char *renter_id, TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
+                   FineLedger *fines, NonceRegistry *nonces, CloudRound *out_rounds) {
     if (rounds < MIN_CLOUD_ROUNDS) rounds = MIN_CLOUD_ROUNDS;
     if (rounds > MAX_CLOUD_ROUNDS) rounds = MAX_CLOUD_ROUNDS;
 
@@ -267,8 +342,13 @@ void mining_cloud(Blockchain *chain, PendingPool *pool, int difficulty, int roun
 
     for (int r = 0; r < rounds; r++) {
         while (pool->count > 0) {
+            Block b;
             unsigned long attempts;
-            Block b = confirm_batch(chain, pool, difficulty, model, utxos, accounts, fines, &attempts);
+            if (!confirm_batch(chain, pool, difficulty, model, utxos, accounts, fines, nonces, &b, &attempts)) {
+                printf("  [round %d] %d record(s) left in the pool could not be confirmed (nonce mismatch).\n",
+                       r + 1, pool->count);
+                break;
+            }
             printf("  [round %d] sealed block %d with %d record(s)\n", r + 1, b.index, b.record_count);
         }
 

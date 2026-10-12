@@ -123,7 +123,7 @@ const LendingRecord *blockchain_last_action_for_copy(const Blockchain *chain, co
     return NULL;
 }
 
-int blockchain_validate(const Blockchain *chain, EVP_PKEY *pkey) {
+int blockchain_validate(const Blockchain *chain, MemberKeyStore *keys) {
     int all_valid = 1;
 
     for (int i = 0; i < chain->count; i++) {
@@ -149,7 +149,8 @@ int blockchain_validate(const Blockchain *chain, EVP_PKEY *pkey) {
 
         int sig_ok = 1;
         for (int r = 0; r < b->record_count; r++) {
-            if (!blockchain_verify_record(&b->records[r], pkey)) {
+            EVP_PKEY *signer_key = member_key_store_get(keys, b->records[r].member_id);
+            if (signer_key == NULL || !blockchain_verify_record(&b->records[r], signer_key)) {
                 sig_ok = 0;
                 break;
             }
@@ -176,7 +177,7 @@ static const char *format_timestamp(time_t ts, char *out, size_t out_size) {
     return out;
 }
 
-void blockchain_print_records(const Blockchain *chain, EVP_PKEY *pkey) {
+void blockchain_print_records(const Blockchain *chain, MemberKeyStore *keys) {
     for (int i = 0; i < chain->count; i++) {
         const Block *b = &chain->blocks[i];
         char ts[32];
@@ -194,7 +195,8 @@ void blockchain_print_records(const Blockchain *chain, EVP_PKEY *pkey) {
 
         for (int r = 0; r < b->record_count; r++) {
             const LendingRecord *rec = &b->records[r];
-            int sig_ok = blockchain_verify_record(rec, pkey);
+            EVP_PKEY *signer_key = member_key_store_get(keys, rec->member_id);
+            int sig_ok = signer_key != NULL && blockchain_verify_record(rec, signer_key);
             char rts[32];
             format_timestamp(rec->timestamp, rts, sizeof(rts));
             printf("  --- Record %d ---\n", r);

@@ -7,4 +7,6 @@ account_ledger.dat
 copy_inventory.dat
 reservation_queue.dat
 fine_ledger.dat
+nonce_registry.dat
 keys/*.pem
+keys/members/*.pem

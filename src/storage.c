@@ -320,3 +320,37 @@ int storage_save_fine_ledger(const FineLedger *ledger, const char *path) {
     fclose(fp);
     return ok;
 }
+
+int storage_load_nonce_registry(NonceRegistry *reg, const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) return 0;
+
+    int count = 0;
+    if (fread(&count, sizeof(int), 1, fp) != 1 || count < 0) {
+        fclose(fp);
+        return 0;
+    }
+    if (count > reg->capacity) {
+        reg->capacity = count > 0 ? count : 1;
+        reg->entries = realloc(reg->entries, sizeof(MemberNonce) * (size_t)reg->capacity);
+    }
+    if (count > 0 && fread(reg->entries, sizeof(MemberNonce), (size_t)count, fp) != (size_t)count) {
+        fclose(fp);
+        return 0;
+    }
+    reg->count = count;
+    fclose(fp);
+    return 1;
+}
+
+int storage_save_nonce_registry(const NonceRegistry *reg, const char *path) {
+    FILE *fp = fopen(path, "wb");
+    if (fp == NULL) return 0;
+
+    int ok = fwrite(&reg->count, sizeof(int), 1, fp) == 1;
+    if (ok && reg->count > 0) {
+        ok = fwrite(reg->entries, sizeof(MemberNonce), (size_t)reg->count, fp) == (size_t)reg->count;
+    }
+    fclose(fp);
+    return ok;
+}

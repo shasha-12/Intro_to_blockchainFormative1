@@ -7,6 +7,7 @@
 #include "account.h"
 #include "inventory.h"
 #include "fines.h"
+#include "nonce_registry.h"
 
 int storage_load_chain(Blockchain *chain, const char *path);
 
@@ -43,5 +44,9 @@ int storage_save_reservation_queue(const ReservationQueue *q, const char *path);
 int storage_load_fine_ledger(FineLedger *ledger, const char *path);
 
 int storage_save_fine_ledger(const FineLedger *ledger, const char *path);
+
+int storage_load_nonce_registry(NonceRegistry *reg, const char *path);
+
+int storage_save_nonce_registry(const NonceRegistry *reg, const char *path);
 
 #endif
