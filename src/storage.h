@@ -6,6 +6,7 @@
 #include "utxo.h"
 #include "account.h"
 #include "inventory.h"
+#include "fines.h"
 
 int storage_load_chain(Blockchain *chain, const char *path);
 
@@ -38,5 +39,9 @@ int storage_save_copy_inventory(const CopyInventory *inv, const char *path);
 int storage_load_reservation_queue(ReservationQueue *q, const char *path);
 
 int storage_save_reservation_queue(const ReservationQueue *q, const char *path);
+
+int storage_load_fine_ledger(FineLedger *ledger, const char *path);
+
+int storage_save_fine_ledger(const FineLedger *ledger, const char *path);
 
 #endif

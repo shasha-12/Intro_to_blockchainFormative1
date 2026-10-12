@@ -16,6 +16,7 @@ typedef struct {
     char state[12];
     char current_holder_id[20];
     time_t due_date;
+    int renewal_count;
 } Copy;
 
 typedef struct {

@@ -8,7 +8,7 @@ ifneq ($(OPENSSL_PREFIX),)
     LDFLAGS += -L$(OPENSSL_PREFIX)/lib
 endif
 
-SRC = src/main.c src/registry.c src/crypto.c src/blockchain.c src/merkle.c src/inventory.c src/pending_pool.c src/mining.c src/utxo.c src/account.c src/storage.c
+SRC = src/main.c src/registry.c src/crypto.c src/blockchain.c src/merkle.c src/inventory.c src/fines.c src/pending_pool.c src/mining.c src/utxo.c src/account.c src/storage.c
 OBJ = $(SRC:.c=.o)
 TARGET = library_tracker
 

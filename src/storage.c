@@ -286,3 +286,37 @@ int storage_save_reservation_queue(const ReservationQueue *q, const char *path) 
     fclose(fp);
     return ok;
 }
+
+int storage_load_fine_ledger(FineLedger *ledger, const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) return 0;
+
+    int count = 0;
+    if (fread(&count, sizeof(int), 1, fp) != 1 || count < 0) {
+        fclose(fp);
+        return 0;
+    }
+    if (count > ledger->capacity) {
+        ledger->capacity = count > 0 ? count : 1;
+        ledger->accounts = realloc(ledger->accounts, sizeof(FineAccount) * (size_t)ledger->capacity);
+    }
+    if (count > 0 && fread(ledger->accounts, sizeof(FineAccount), (size_t)count, fp) != (size_t)count) {
+        fclose(fp);
+        return 0;
+    }
+    ledger->count = count;
+    fclose(fp);
+    return 1;
+}
+
+int storage_save_fine_ledger(const FineLedger *ledger, const char *path) {
+    FILE *fp = fopen(path, "wb");
+    if (fp == NULL) return 0;
+
+    int ok = fwrite(&ledger->count, sizeof(int), 1, fp) == 1;
+    if (ok && ledger->count > 0) {
+        ok = fwrite(ledger->accounts, sizeof(FineAccount), (size_t)ledger->count, fp) == (size_t)ledger->count;
+    }
+    fclose(fp);
+    return ok;
+}

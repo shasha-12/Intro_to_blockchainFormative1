@@ -27,22 +27,29 @@ static unsigned long mine_block(Block *b, int difficulty) {
     return attempts;
 }
 
+static int sets_due_date(const char *action) {
+    return strcmp(action, ACTION_BORROWED) == 0 || strcmp(action, ACTION_RENEWED) == 0;
+}
+
 /* A RETURNED record doesn't carry its own reward amount - it's derived
- * deterministically from the matching BORROWED record's due_date versus
- * this record's own timestamp, so the reward is always a function of
- * on-chain history rather than a separately trusted value. The match may
- * be sitting earlier in the same batch (not yet on the chain) or already
- * confirmed, so both are checked. */
+ * deterministically from the most recent BORROWED-or-RENEWED record's
+ * due_date versus this record's own timestamp, so the reward is always a
+ * function of on-chain history rather than a separately trusted value.
+ * RENEWED has to count here too, not just BORROWED - otherwise a renewed
+ * loan would always be judged against its original, now-stale due date
+ * instead of the extended one. The match may be sitting earlier in the
+ * same batch (not yet on the chain) or already confirmed, so both are
+ * checked. */
 static int find_due_date_for_copy(const Blockchain *chain, const LendingRecord *batch,
                                    int batch_pos, const char *copy_id, time_t *out_due_date) {
     for (int i = batch_pos - 1; i >= 0; i--) {
-        if (strcmp(batch[i].copy_id, copy_id) == 0 && strcmp(batch[i].action, ACTION_BORROWED) == 0) {
+        if (strcmp(batch[i].copy_id, copy_id) == 0 && sets_due_date(batch[i].action)) {
             *out_due_date = batch[i].due_date;
             return 1;
         }
     }
     const LendingRecord *last = blockchain_last_action_for_copy(chain, copy_id);
-    if (last != NULL && strcmp(last->action, ACTION_BORROWED) == 0) {
+    if (last != NULL && sets_due_date(last->action)) {
         *out_due_date = last->due_date;
         return 1;
     }
@@ -87,7 +94,7 @@ static void credit_miner_amount(const char *miner_id, int amount, TransactionMod
  * reward is distributed afterward. */
 static Block confirm_batch(Blockchain *chain, PendingPool *pool, int difficulty,
                             TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
-                            unsigned long *out_attempts) {
+                            FineLedger *fines, unsigned long *out_attempts) {
     int batch_count = pool->count < MAX_RECORDS_PER_BLOCK ? pool->count : MAX_RECORDS_PER_BLOCK;
     LendingRecord batch[MAX_RECORDS_PER_BLOCK];
     for (int i = 0; i < batch_count; i++) {
@@ -119,6 +126,11 @@ static Block confirm_batch(Blockchain *chain, PendingPool *pool, int difficulty,
                 credit_member_reward(batch[i].member_id, reward, b.transaction_id, model, utxos, accounts);
             }
         }
+        /* A fine only becomes real once its record is confirmed - the
+         * same "nothing counts until it's mined" rule as token rewards. */
+        if (batch[i].fine_amount > 0) {
+            fine_ledger_accrue(fines, batch[i].member_id, batch[i].fine_amount);
+        }
     }
 
     for (int i = 0; i < batch_count; i++) {
@@ -129,7 +141,7 @@ static Block confirm_batch(Blockchain *chain, PendingPool *pool, int difficulty,
 }
 
 int mining_solo(Blockchain *chain, PendingPool *pool, int difficulty, const char *miner_id,
-                 TransactionModel model, UTXOSet *utxos, AccountLedger *accounts) {
+                 TransactionModel model, UTXOSet *utxos, AccountLedger *accounts, FineLedger *fines) {
     if (pool->count == 0) {
         printf("Pending pool is empty - nothing to mine.\n");
         return 0;
@@ -143,7 +155,7 @@ int mining_solo(Blockchain *chain, PendingPool *pool, int difficulty, const char
 
     while (pool->count > 0) {
         unsigned long attempts;
-        Block b = confirm_batch(chain, pool, difficulty, model, utxos, accounts, &attempts);
+        Block b = confirm_batch(chain, pool, difficulty, model, utxos, accounts, fines, &attempts);
         total_attempts += attempts;
         blocks_confirmed++;
 
@@ -166,7 +178,7 @@ int mining_solo(Blockchain *chain, PendingPool *pool, int difficulty, const char
 }
 
 int mining_pool(Blockchain *chain, PendingPool *pool, int difficulty, int num_miners,
-                 TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
+                 TransactionModel model, UTXOSet *utxos, AccountLedger *accounts, FineLedger *fines,
                  PoolMinerResult *out_results) {
     if (pool->count == 0) {
         printf("Pending pool is empty - nothing to mine.\n");
@@ -183,7 +195,7 @@ int mining_pool(Blockchain *chain, PendingPool *pool, int difficulty, int num_mi
 
     while (pool->count > 0) {
         unsigned long attempts;
-        Block b = confirm_batch(chain, pool, difficulty, model, utxos, accounts, &attempts);
+        Block b = confirm_batch(chain, pool, difficulty, model, utxos, accounts, fines, &attempts);
         total_attempts += attempts;
         blocks_confirmed++;
         printf("  Sealed block %d with %d record(s) - %lu hash attempt(s)\n",
@@ -244,7 +256,7 @@ int mining_pool(Blockchain *chain, PendingPool *pool, int difficulty, int num_mi
 
 void mining_cloud(Blockchain *chain, PendingPool *pool, int difficulty, int rounds,
                    const char *renter_id, TransactionModel model,
-                   UTXOSet *utxos, AccountLedger *accounts, CloudRound *out_rounds) {
+                   UTXOSet *utxos, AccountLedger *accounts, FineLedger *fines, CloudRound *out_rounds) {
     if (rounds < MIN_CLOUD_ROUNDS) rounds = MIN_CLOUD_ROUNDS;
     if (rounds > MAX_CLOUD_ROUNDS) rounds = MAX_CLOUD_ROUNDS;
 
@@ -256,7 +268,7 @@ void mining_cloud(Blockchain *chain, PendingPool *pool, int difficulty, int roun
     for (int r = 0; r < rounds; r++) {
         while (pool->count > 0) {
             unsigned long attempts;
-            Block b = confirm_batch(chain, pool, difficulty, model, utxos, accounts, &attempts);
+            Block b = confirm_batch(chain, pool, difficulty, model, utxos, accounts, fines, &attempts);
             printf("  [round %d] sealed block %d with %d record(s)\n", r + 1, b.index, b.record_count);
         }
 

@@ -69,6 +69,7 @@ int copy_inventory_load(CopyInventory *inv, const char *path, const Registry *re
         strncpy(c->state, COPY_STATE_AVAILABLE, sizeof(c->state) - 1);
         c->current_holder_id[0] = '\0';
         c->due_date = 0;
+        c->renewal_count = 0;
         inv->count++;
     }
     fclose(fp);

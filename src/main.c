@@ -6,6 +6,7 @@
 #include "crypto.h"
 #include "blockchain.h"
 #include "inventory.h"
+#include "fines.h"
 #include "pending_pool.h"
 #include "mining.h"
 #include "utxo.h"
@@ -21,15 +22,23 @@
 #define ACCOUNT_FILE "account_ledger.dat"
 #define COPY_STATE_FILE "copy_inventory.dat"
 #define RESERVATION_FILE "reservation_queue.dat"
+#define FINE_FILE "fine_ledger.dat"
 #define NETWORK_ACCOUNT "NETWORK"
 #define PRIV_KEY_FILE "keys/private.pem"
 #define PUB_KEY_FILE "keys/public.pem"
 
-/* A book borrowed now is due this many seconds later - a real loan
- * period would be measured in days, but that isn't demoable inside a
- * short video, so this is a deliberate simulation shortcut, documented
- * as such in the technical report. */
+/* A book borrowed now is due this many seconds later, and each renewal
+ * extends it by the same window - a real loan period would be measured
+ * in days, but that isn't demoable inside a short video, so this is a
+ * deliberate simulation shortcut, documented as such in the technical
+ * report. SIMULATED_DAY_SECONDS is the same idea applied to "a day
+ * overdue" for fine accrual, so a fine can actually be seen growing on
+ * camera instead of requiring real days to pass. */
 #define LOAN_PERIOD_SECONDS 15
+#define RENEWAL_PERIOD_SECONDS 15
+#define MAX_RENEWALS 2
+#define SIMULATED_DAY_SECONDS 5
+#define FINE_PER_DAY 2
 
 static const char *model_name(TransactionModel model) {
     return model == MODEL_UTXO ? "UTXO" : "Account-based";
@@ -71,7 +80,8 @@ static void print_commands(int difficulty, TransactionModel model) {
     printf("\n===== Library Lending Tracker ===== [model: %s, difficulty: %d]\n",
            model_name(model), difficulty);
     printf("Book/Copy:    register_book  view_book  add_copy  view_copy  mark_lost\n");
-    printf("Lending:      borrow_book  return_book  reserve_book  reservation_status\n");
+    printf("Lending:      borrow_book  return_book  renew_book  reserve_book  reservation_status\n");
+    printf("Fines:        check_overdue  view_fines  settle_fine\n");
     printf("Pool/Mining:  pool_view  mine_solo  mine_pool  mine_cloud <rounds>\n");
     printf("              difficulty_status  set_difficulty\n");
     printf("Chain:        chain_view  validate_chain  chain_save  chain_load  tamper_block\n");
@@ -300,17 +310,20 @@ static void handle_return(PendingPool *pool, const Blockchain *chain,
     printf("Enter Copy ID: ");
     read_line(copy_id, sizeof(copy_id));
 
-    const LendingRecord *last = current_loan_status(pool, chain, copy_id);
-    if (last == NULL || strcmp(last->action, ACTION_BORROWED) != 0) {
-        printf("ERROR: No active loan found for copy ID '%s'\n", copy_id);
-        return;
-    }
-
     Copy *copy = copy_inventory_find(inv, copy_id);
     if (copy == NULL) {
         printf("ERROR: Copy '%s' is not in the inventory\n", copy_id);
         return;
     }
+    /* The copy's own state is the authority on whether it's on loan -
+     * the last lending record's action might be RENEWED rather than
+     * BORROWED if it's been renewed since, which still means it's out. */
+    if (strcmp(copy->state, COPY_STATE_BORROWED) != 0) {
+        printf("ERROR: Copy '%s' is not currently on loan (state: %s)\n", copy_id, copy->state);
+        return;
+    }
+
+    const LendingRecord *last = current_loan_status(pool, chain, copy_id);
 
     LendingRecord rec = {0};
     rec.record_id = next_record_id(chain, pool);
@@ -322,8 +335,18 @@ static void handle_return(PendingPool *pool, const Blockchain *chain,
     strncpy(rec.action, ACTION_RETURNED, sizeof(rec.action) - 1);
     rec.timestamp = time(NULL);
     rec.due_date = last->due_date;
-    rec.fine_amount = 0;
     rec.nonce = 0;
+
+    /* A late return gets both a reduced token reward (handled at mining
+     * time) and a fine, calculated per simulated day late - rounding up,
+     * so even a few seconds into the next day counts as a full day. */
+    if (rec.timestamp > rec.due_date) {
+        long seconds_late = (long)(rec.timestamp - rec.due_date);
+        long days_late = (seconds_late + SIMULATED_DAY_SECONDS - 1) / SIMULATED_DAY_SECONDS;
+        rec.fine_amount = (int)days_late * FINE_PER_DAY;
+    } else {
+        rec.fine_amount = 0;
+    }
 
     if (!blockchain_sign_record(&rec, pkey)) {
         printf("ERROR: Failed to sign return request\n");
@@ -335,24 +358,85 @@ static void handle_return(PendingPool *pool, const Blockchain *chain,
 
     /* BORROWED -> AVAILABLE, or RESERVED (held for the next member in
      * line) if anyone is waiting for this title. */
+    char fine_note[32] = "";
+    if (rec.fine_amount > 0) {
+        snprintf(fine_note, sizeof(fine_note), ", fine %d", rec.fine_amount);
+    }
+
     char next_member[20];
     if (reservation_queue_pop_next(reservations, copy->book_id, next_member)) {
         strncpy(copy->state, COPY_STATE_RESERVED, sizeof(copy->state) - 1);
         strncpy(copy->current_holder_id, next_member, sizeof(copy->current_holder_id) - 1);
-        printf("OK: '%s' return by %s added to the pending pool - awaiting mining (%s). Copy %s now held for %s.\n",
+        printf("OK: '%s' return by %s added to the pending pool - awaiting mining (%s%s). Copy %s now held for %s.\n",
                last->book_title, last->member_name,
-               rec.timestamp <= last->due_date ? "on-time" : "late", copy_id, next_member);
+               rec.timestamp <= last->due_date ? "on-time" : "late", fine_note, copy_id, next_member);
     } else {
         strncpy(copy->state, COPY_STATE_AVAILABLE, sizeof(copy->state) - 1);
         copy->current_holder_id[0] = '\0';
-        printf("OK: '%s' return by %s added to the pending pool - awaiting mining (%s, reward decided on confirmation).\n",
+        printf("OK: '%s' return by %s added to the pending pool - awaiting mining (%s%s, reward decided on confirmation).\n",
                last->book_title, last->member_name,
-               rec.timestamp <= last->due_date ? "on-time" : "late");
+               rec.timestamp <= last->due_date ? "on-time" : "late", fine_note);
     }
     copy->state[sizeof(copy->state) - 1] = '\0';
     copy->current_holder_id[sizeof(copy->current_holder_id) - 1] = '\0';
     copy->due_date = 0;
+    copy->renewal_count = 0;
     save_inventory_state(inv, reservations);
+}
+
+static void handle_renew_book(PendingPool *pool, const Blockchain *chain, CopyInventory *inv,
+                               ReservationQueue *reservations, EVP_PKEY *pkey) {
+    char copy_id[20];
+    printf("Enter Copy ID: ");
+    read_line(copy_id, sizeof(copy_id));
+
+    Copy *copy = copy_inventory_find(inv, copy_id);
+    if (copy == NULL) {
+        printf("ERROR: Copy '%s' is not in the inventory\n", copy_id);
+        return;
+    }
+    if (strcmp(copy->state, COPY_STATE_BORROWED) != 0) {
+        printf("ERROR: Copy '%s' is not currently on loan (state: %s)\n", copy_id, copy->state);
+        return;
+    }
+    if (reservation_queue_has_waiting(reservations, copy->book_id)) {
+        printf("ERROR: Another member is waiting for '%s' - cannot renew\n", copy->book_id);
+        return;
+    }
+    if (copy->renewal_count >= MAX_RENEWALS) {
+        printf("ERROR: Copy '%s' has already been renewed the maximum %d time(s)\n", copy_id, MAX_RENEWALS);
+        return;
+    }
+
+    const LendingRecord *last = current_loan_status(pool, chain, copy_id);
+
+    LendingRecord rec = {0};
+    rec.record_id = next_record_id(chain, pool);
+    strncpy(rec.book_id, last->book_id, sizeof(rec.book_id) - 1);
+    strncpy(rec.copy_id, last->copy_id, sizeof(rec.copy_id) - 1);
+    strncpy(rec.book_title, last->book_title, sizeof(rec.book_title) - 1);
+    strncpy(rec.member_id, last->member_id, sizeof(rec.member_id) - 1);
+    strncpy(rec.member_name, last->member_name, sizeof(rec.member_name) - 1);
+    strncpy(rec.action, ACTION_RENEWED, sizeof(rec.action) - 1);
+    rec.timestamp = time(NULL);
+    rec.due_date = last->due_date + RENEWAL_PERIOD_SECONDS;
+    rec.fine_amount = 0;
+    rec.nonce = 0;
+
+    if (!blockchain_sign_record(&rec, pkey)) {
+        printf("ERROR: Failed to sign renewal request\n");
+        return;
+    }
+
+    pending_pool_add(pool, &rec);
+    storage_save_pending_pool(pool, POOL_FILE);
+
+    copy->due_date = rec.due_date;
+    copy->renewal_count++;
+    save_inventory_state(inv, reservations);
+
+    printf("OK: Copy '%s' renewal %d/%d added to the pending pool - new due date pending confirmation.\n",
+           copy_id, copy->renewal_count, MAX_RENEWALS);
 }
 
 static void handle_reserve_book(const Registry *reg, CopyInventory *inv, ReservationQueue *reservations) {
@@ -380,6 +464,101 @@ static void handle_reservation_status(const ReservationQueue *reservations) {
     reservation_queue_print(reservations);
 }
 
+/* Scans every currently-BORROWED copy for a due_date that's passed, and
+ * either creates a new pending OVERDUE record or - if that copy is
+ * already flagged and still sitting unconfirmed in the pool - updates
+ * the fine in place, since more simulated days may have passed since it
+ * was first flagged. Re-signing after mutating a pending record is
+ * required: the signature covers fine_amount and timestamp, both of
+ * which just changed. */
+static void handle_check_overdue(PendingPool *pool, const Blockchain *chain,
+                                  CopyInventory *inv, EVP_PKEY *pkey) {
+    time_t now = time(NULL);
+    int flagged = 0;
+
+    for (int i = 0; i < inv->count; i++) {
+        Copy *c = &inv->copies[i];
+        if (strcmp(c->state, COPY_STATE_BORROWED) != 0) continue;
+        if (c->due_date == 0 || now <= c->due_date) continue;
+
+        long seconds_late = (long)(now - c->due_date);
+        long days_late = (seconds_late + SIMULATED_DAY_SECONDS - 1) / SIMULATED_DAY_SECONDS;
+        int fine = (int)days_late * FINE_PER_DAY;
+
+        LendingRecord *existing = NULL;
+        for (int j = 0; j < pool->count; j++) {
+            if (strcmp(pool->entries[j].copy_id, c->copy_id) == 0 &&
+                strcmp(pool->entries[j].action, ACTION_OVERDUE) == 0) {
+                existing = &pool->entries[j];
+                break;
+            }
+        }
+
+        if (existing != NULL) {
+            if (fine != existing->fine_amount) {
+                existing->fine_amount = fine;
+                existing->timestamp = now;
+                blockchain_sign_record(existing, pkey);
+                flagged++;
+            }
+            continue;
+        }
+
+        /* The copy's state already confirms it's on loan (checked at the
+         * top of this loop) - last may be a BORROWED or RENEWED record,
+         * either way it carries the book_title/member_name needed below. */
+        const LendingRecord *last = current_loan_status(pool, chain, c->copy_id);
+        if (last == NULL) continue;
+
+        LendingRecord rec = {0};
+        rec.record_id = next_record_id(chain, pool);
+        strncpy(rec.book_id, last->book_id, sizeof(rec.book_id) - 1);
+        strncpy(rec.copy_id, c->copy_id, sizeof(rec.copy_id) - 1);
+        strncpy(rec.book_title, last->book_title, sizeof(rec.book_title) - 1);
+        strncpy(rec.member_id, c->current_holder_id, sizeof(rec.member_id) - 1);
+        strncpy(rec.member_name, last->member_name, sizeof(rec.member_name) - 1);
+        strncpy(rec.action, ACTION_OVERDUE, sizeof(rec.action) - 1);
+        rec.timestamp = now;
+        rec.due_date = c->due_date;
+        rec.fine_amount = fine;
+        rec.nonce = 0;
+
+        if (blockchain_sign_record(&rec, pkey)) {
+            pending_pool_add(pool, &rec);
+            flagged++;
+        }
+    }
+
+    if (flagged > 0) {
+        storage_save_pending_pool(pool, POOL_FILE);
+        printf("Flagged or updated %d overdue copy(ies) - fines pending confirmation.\n", flagged);
+    } else {
+        printf("No overdue copies found.\n");
+    }
+}
+
+static void handle_view_fines(const FineLedger *fines) {
+    fine_ledger_print(fines);
+}
+
+static void handle_settle_fine(FineLedger *fines) {
+    char member_id[20], input[16];
+    printf("Member ID: ");
+    read_line(member_id, sizeof(member_id));
+    printf("Amount to settle: ");
+    read_line(input, sizeof(input));
+    int amount = atoi(input);
+
+    if (!fine_ledger_settle(fines, member_id, amount)) {
+        printf("ERROR: '%s' does not owe at least %d\n", member_id, amount);
+        return;
+    }
+
+    storage_save_fine_ledger(fines, FINE_FILE);
+    printf("OK: Settled %d for %s (remaining owed: %d)\n",
+           amount, member_id, fine_ledger_owed(fines, member_id));
+}
+
 static void save_ledgers(TransactionModel model, UTXOSet *utxos, AccountLedger *accounts) {
     if (model == MODEL_UTXO) {
         storage_save_utxo_set(utxos, UTXO_FILE);
@@ -400,7 +579,8 @@ static void print_ledger_state(TransactionModel model, UTXOSet *utxos, AccountLe
 }
 
 static void handle_mine_solo(Blockchain *chain, PendingPool *pool, int difficulty,
-                              TransactionModel model, UTXOSet *utxos, AccountLedger *accounts) {
+                              TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
+                              FineLedger *fines) {
     char miner_id[50];
     printf("Enter Miner ID: ");
     read_line(miner_id, sizeof(miner_id));
@@ -408,33 +588,36 @@ static void handle_mine_solo(Blockchain *chain, PendingPool *pool, int difficult
         strcpy(miner_id, "MINER1");
     }
 
-    mining_solo(chain, pool, difficulty, miner_id, model, utxos, accounts);
+    mining_solo(chain, pool, difficulty, miner_id, model, utxos, accounts, fines);
 
     storage_save_chain(chain, CHAIN_FILE);
     storage_save_pending_pool(pool, POOL_FILE);
     save_ledgers(model, utxos, accounts);
+    storage_save_fine_ledger(fines, FINE_FILE);
     print_ledger_state(model, utxos, accounts);
 }
 
 static void handle_mine_pool(Blockchain *chain, PendingPool *pool, int difficulty,
-                              TransactionModel model, UTXOSet *utxos, AccountLedger *accounts) {
+                              TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
+                              FineLedger *fines) {
     char input[16];
     printf("Number of pool miners (%d-%d, default %d): ", 1, MAX_POOL_MINERS, DEFAULT_POOL_MINERS);
     read_line(input, sizeof(input));
     int num_miners = input[0] == '\0' ? DEFAULT_POOL_MINERS : atoi(input);
 
     PoolMinerResult results[MAX_POOL_MINERS];
-    mining_pool(chain, pool, difficulty, num_miners, model, utxos, accounts, results);
+    mining_pool(chain, pool, difficulty, num_miners, model, utxos, accounts, fines, results);
 
     storage_save_chain(chain, CHAIN_FILE);
     storage_save_pending_pool(pool, POOL_FILE);
     save_ledgers(model, utxos, accounts);
+    storage_save_fine_ledger(fines, FINE_FILE);
     print_ledger_state(model, utxos, accounts);
 }
 
 static void handle_mine_cloud(Blockchain *chain, PendingPool *pool, int difficulty,
                                TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
-                               const char *arg) {
+                               FineLedger *fines, const char *arg) {
     char renter_id[50], input[16];
     printf("Enter Renter ID: ");
     read_line(renter_id, sizeof(renter_id));
@@ -452,11 +635,12 @@ static void handle_mine_cloud(Blockchain *chain, PendingPool *pool, int difficul
     }
 
     CloudRound rounds_out[MAX_CLOUD_ROUNDS];
-    mining_cloud(chain, pool, difficulty, rounds, renter_id, model, utxos, accounts, rounds_out);
+    mining_cloud(chain, pool, difficulty, rounds, renter_id, model, utxos, accounts, fines, rounds_out);
 
     storage_save_chain(chain, CHAIN_FILE);
     storage_save_pending_pool(pool, POOL_FILE);
     save_ledgers(model, utxos, accounts);
+    storage_save_fine_ledger(fines, FINE_FILE);
     print_ledger_state(model, utxos, accounts);
 }
 
@@ -724,6 +908,10 @@ int main(int argc, char *argv[]) {
     reservation_queue_init(&reservations);
     storage_load_reservation_queue(&reservations, RESERVATION_FILE);
 
+    FineLedger fines;
+    fine_ledger_init(&fines);
+    storage_load_fine_ledger(&fines, FINE_FILE);
+
     if (!model_set_by_arg) {
         printf("\nChoose a transaction model for this session:\n");
         printf("  1. UTXO\n");
@@ -735,6 +923,11 @@ int main(int argc, char *argv[]) {
     }
     printf("Active transaction model: %s (applies to all token activity this session)\n",
            model_name(model));
+
+    /* Overdue detection runs automatically on this CLI invocation (i.e.
+     * each time the program starts), in addition to being callable
+     * on-demand mid-session via check_overdue. */
+    handle_check_overdue(&pool, &chain, &inv, pkey);
 
     int running = 1;
     while (running) {
@@ -765,18 +958,26 @@ int main(int argc, char *argv[]) {
             handle_borrow(&pool, &chain, &reg, &inv, &reservations, pkey);
         } else if (strcmp(cmd, "return_book") == 0) {
             handle_return(&pool, &chain, &inv, &reservations, pkey);
+        } else if (strcmp(cmd, "renew_book") == 0) {
+            handle_renew_book(&pool, &chain, &inv, &reservations, pkey);
         } else if (strcmp(cmd, "reserve_book") == 0) {
             handle_reserve_book(&reg, &inv, &reservations);
         } else if (strcmp(cmd, "reservation_status") == 0) {
             handle_reservation_status(&reservations);
+        } else if (strcmp(cmd, "check_overdue") == 0) {
+            handle_check_overdue(&pool, &chain, &inv, pkey);
+        } else if (strcmp(cmd, "view_fines") == 0) {
+            handle_view_fines(&fines);
+        } else if (strcmp(cmd, "settle_fine") == 0) {
+            handle_settle_fine(&fines);
         } else if (strcmp(cmd, "pool_view") == 0) {
             pending_pool_print(&pool);
         } else if (strcmp(cmd, "mine_solo") == 0) {
-            handle_mine_solo(&chain, &pool, difficulty, model, &utxos, &accounts);
+            handle_mine_solo(&chain, &pool, difficulty, model, &utxos, &accounts, &fines);
         } else if (strcmp(cmd, "mine_pool") == 0) {
-            handle_mine_pool(&chain, &pool, difficulty, model, &utxos, &accounts);
+            handle_mine_pool(&chain, &pool, difficulty, model, &utxos, &accounts, &fines);
         } else if (strcmp(cmd, "mine_cloud") == 0) {
-            handle_mine_cloud(&chain, &pool, difficulty, model, &utxos, &accounts, arg);
+            handle_mine_cloud(&chain, &pool, difficulty, model, &utxos, &accounts, &fines, arg);
         } else if (strcmp(cmd, "difficulty_status") == 0) {
             printf("Current mining difficulty: %d (range %d-%d)\n", difficulty, MIN_DIFFICULTY, MAX_DIFFICULTY);
         } else if (strcmp(cmd, "set_difficulty") == 0) {
@@ -839,6 +1040,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    fine_ledger_free(&fines);
     reservation_queue_free(&reservations);
     copy_inventory_free(&inv);
     account_ledger_free(&accounts);
