@@ -27,14 +27,16 @@ static void ensure_capacity(PendingPool *pool) {
     }
 }
 
-void pending_pool_add(PendingPool *pool, const LendingRecord *entry) {
+PendingEntry *pending_pool_add(PendingPool *pool, const LendingRecord *entry) {
     ensure_capacity(pool);
     PendingEntry *e = &pool->entries[pool->count];
     e->request_id = pool->next_request_id++;
     e->record = *entry;
     e->status = POOL_STATUS_PENDING;
+    e->flag_reason[0] = '\0';
     e->priority = 2;
     pool->count++;
+    return e;
 }
 
 void pending_pool_remove_at(PendingPool *pool, int i) {
@@ -52,6 +54,37 @@ const LendingRecord *pending_pool_last_action_for_copy(const PendingPool *pool, 
         }
     }
     return NULL;
+}
+
+int pending_pool_is_duplicate_request(const PendingPool *pool, const Blockchain *chain,
+                                       unsigned long record_id) {
+    for (int i = 0; i < pool->count; i++) {
+        if (pool->entries[i].record.record_id == record_id) return 1;
+    }
+    for (int bi = 0; bi < chain->count; bi++) {
+        const Block *b = &chain->blocks[bi];
+        for (int ri = 0; ri < b->record_count; ri++) {
+            if (b->records[ri].record_id == record_id) return 1;
+        }
+    }
+    return 0;
+}
+
+PendingEntry *pending_pool_find_by_request_id(PendingPool *pool, unsigned long request_id) {
+    for (int i = 0; i < pool->count; i++) {
+        if (pool->entries[i].request_id == request_id) return &pool->entries[i];
+    }
+    return NULL;
+}
+
+int pending_pool_remove_by_request_id(PendingPool *pool, unsigned long request_id) {
+    for (int i = 0; i < pool->count; i++) {
+        if (pool->entries[i].request_id == request_id) {
+            pending_pool_remove_at(pool, i);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* The oldest (longest-waiting) reservation for book_id, without
@@ -121,6 +154,26 @@ static const char *format_timestamp(time_t ts, char *out, size_t out_size) {
 
 static const char *status_label(PoolEntryStatus status) {
     return status == POOL_STATUS_SUSPICIOUS ? "SUSPICIOUS" : "PENDING";
+}
+
+void pending_pool_print_suspicious(const PendingPool *pool) {
+    int found = 0;
+    printf("--------------- FRAUD REVIEW (flagged requests) ---------------\n");
+    for (int i = 0; i < pool->count; i++) {
+        const PendingEntry *e = &pool->entries[i];
+        if (e->status != POOL_STATUS_SUSPICIOUS) continue;
+        const LendingRecord *r = &e->record;
+        char ts[32];
+        format_timestamp(r->timestamp, ts, sizeof(ts));
+        printf("req#%lu - %s - %s (%s / copy %s) by %s (%s) at %s\n  reason: %s\n",
+               e->request_id, r->action, r->book_title, r->book_id, r->copy_id,
+               r->member_name, r->member_id, ts, e->flag_reason);
+        found++;
+    }
+    if (!found) {
+        printf("(nothing currently flagged)\n");
+    }
+    printf("---------------------------------------------------------------\n");
 }
 
 void pending_pool_print(const PendingPool *pool) {

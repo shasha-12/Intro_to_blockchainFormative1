@@ -41,6 +41,18 @@
 #define SIMULATED_DAY_SECONDS 5
 #define FINE_PER_DAY 2
 
+/* Fraud heuristics: a member holding more than this many copies at once,
+ * or re-borrowing a copy within one simulated day of returning it, gets
+ * their new request flagged SUSPICIOUS instead of silently PENDING -
+ * both are reused exactly as a human librarian would judge them, just
+ * over the simulated time scale this demo runs on. */
+#define MAX_CONCURRENT_BORROWS 3
+#define RAPID_REBORROW_WINDOW_SECONDS SIMULATED_DAY_SECONDS
+
+#define CONDITION_NEW  "NEW"
+#define CONDITION_GOOD "GOOD"
+#define CONDITION_WORN "WORN"
+
 static const char *model_name(TransactionModel model) {
     return model == MODEL_UTXO ? "UTXO" : "Account-based";
 }
@@ -84,6 +96,7 @@ static void print_commands(int difficulty, TransactionModel model) {
     printf("Book/Copy:    register_book  view_book  add_copy  view_copy  mark_lost\n");
     printf("Lending:      borrow_book  return_book  renew_book  reserve_book  reservation_status\n");
     printf("Fines:        check_overdue  view_fines  settle_fine\n");
+    printf("Fraud:        fraud_review  approve_suspicious <id>  reject_suspicious <id>\n");
     printf("Pool/Mining:  pool_view  mine_solo  mine_pool  mine_cloud <rounds>\n");
     printf("              difficulty_status  set_difficulty\n");
     printf("Chain:        chain_view  validate_chain  chain_save  chain_load  tamper_block  replay_test\n");
@@ -134,6 +147,27 @@ static unsigned long next_assignable_nonce(const PendingPool *pool, NonceRegistr
         }
     }
     return n;
+}
+
+static int count_concurrent_borrows(const CopyInventory *inv, const char *member_id) {
+    int count = 0;
+    for (int i = 0; i < inv->count; i++) {
+        if (strcmp(inv->copies[i].current_holder_id, member_id) == 0 &&
+            strcmp(inv->copies[i].state, COPY_STATE_BORROWED) == 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/* NEW < GOOD < WORN, so a higher rank is a worse physical condition.
+ * Unrecognized strings rank as "new" rather than crashing - add_copy
+ * already restricts input to these three, so this only matters if a
+ * saved inventory file was hand-edited. */
+static int condition_rank(const char *condition) {
+    if (strcmp(condition, CONDITION_GOOD) == 0) return 1;
+    if (strcmp(condition, CONDITION_WORN) == 0) return 2;
+    return 0;
 }
 
 static void save_inventory_state(const CopyInventory *inv, const ReservationQueue *q) {
@@ -349,6 +383,24 @@ static void handle_borrow(PendingPool *pool, const Blockchain *chain, const Regi
         return;
     }
 
+    time_t now = time(NULL);
+
+    /* Fraud heuristics 1 and 2, checked before this borrow changes
+     * anything: too many copies already out, or returning this exact
+     * copy and immediately borrowing it again. Checked ahead of signing
+     * since neither depends on the record itself. */
+    const char *flag_reason = NULL;
+    if (count_concurrent_borrows(inv, member->member_id) + 1 > MAX_CONCURRENT_BORROWS) {
+        flag_reason = "excessive concurrent borrows";
+    } else {
+        const LendingRecord *prior = current_loan_status(pool, chain, copy->copy_id);
+        if (prior != NULL && strcmp(prior->action, ACTION_RETURNED) == 0 &&
+            strcmp(prior->member_id, member->member_id) == 0 &&
+            (now - prior->timestamp) < RAPID_REBORROW_WINDOW_SECONDS) {
+            flag_reason = "rapid re-borrow of the same copy within one simulated day";
+        }
+    }
+
     LendingRecord rec = {0};
     rec.record_id = next_record_id(chain, pool);
     strncpy(rec.book_id, book->book_id, sizeof(rec.book_id) - 1);
@@ -357,7 +409,7 @@ static void handle_borrow(PendingPool *pool, const Blockchain *chain, const Regi
     strncpy(rec.member_id, member->member_id, sizeof(rec.member_id) - 1);
     strncpy(rec.member_name, member->full_name, sizeof(rec.member_name) - 1);
     strncpy(rec.action, ACTION_BORROWED, sizeof(rec.action) - 1);
-    rec.timestamp = time(NULL);
+    rec.timestamp = now;
     rec.due_date = rec.timestamp + LOAN_PERIOD_SECONDS;
     rec.fine_amount = 0;
     rec.nonce = next_assignable_nonce(pool, nonces, member->member_id);
@@ -367,7 +419,16 @@ static void handle_borrow(PendingPool *pool, const Blockchain *chain, const Regi
         return;
     }
 
-    pending_pool_add(pool, &rec);
+    if (flag_reason == NULL && pending_pool_is_duplicate_request(pool, chain, rec.record_id)) {
+        flag_reason = "duplicate request_id (already seen in the pool or on-chain)";
+    }
+
+    PendingEntry *entry = pending_pool_add(pool, &rec);
+    if (flag_reason != NULL) {
+        entry->status = POOL_STATUS_SUSPICIOUS;
+        strncpy(entry->flag_reason, flag_reason, sizeof(entry->flag_reason) - 1);
+        printf("FRAUD ALERT: borrow request flagged SUSPICIOUS (%s) - see fraud_review.\n", flag_reason);
+    }
     storage_save_pending_pool(pool, POOL_FILE);
 
     strncpy(copy->state, COPY_STATE_BORROWED, sizeof(copy->state) - 1);
@@ -402,6 +463,41 @@ static void handle_return(PendingPool *pool, const Blockchain *chain, CopyInvent
 
     const LendingRecord *last = current_loan_status(pool, chain, copy_id);
 
+    /* Fraud heuristic 4: a member reporting a worse condition than the
+     * copy is currently on record for is only accepted outright with a
+     * librarian override reason - otherwise it's still applied (a
+     * reported knock can't be un-reported) but flagged for review. */
+    char condition_input[10];
+    printf("Reported condition (NEW/GOOD/WORN, blank = unchanged from %s): ", copy->condition);
+    read_line(condition_input, sizeof(condition_input));
+
+    const char *flag_reason = NULL;
+    int condition_changed = 0;
+    char new_condition[10];
+    strncpy(new_condition, copy->condition, sizeof(new_condition) - 1);
+    new_condition[sizeof(new_condition) - 1] = '\0';
+
+    if (condition_input[0] != '\0' &&
+        (strcmp(condition_input, CONDITION_NEW) == 0 || strcmp(condition_input, CONDITION_GOOD) == 0 ||
+         strcmp(condition_input, CONDITION_WORN) == 0)) {
+        if (condition_rank(condition_input) != condition_rank(copy->condition)) {
+            condition_changed = 1;
+            strncpy(new_condition, condition_input, sizeof(new_condition) - 1);
+            new_condition[sizeof(new_condition) - 1] = '\0';
+        }
+        if (condition_rank(condition_input) > condition_rank(copy->condition)) {
+            char override_input[64];
+            printf("Condition downgrade reported (%s -> %s). Librarian override reason (blank = none): ",
+                   copy->condition, condition_input);
+            read_line(override_input, sizeof(override_input));
+            if (override_input[0] == '\0') {
+                flag_reason = "condition downgrade reported without a librarian override";
+            }
+        }
+    } else if (condition_input[0] != '\0') {
+        printf("WARNING: '%s' is not a recognized condition - left unchanged.\n", condition_input);
+    }
+
     LendingRecord rec = {0};
     rec.record_id = next_record_id(chain, pool);
     strncpy(rec.book_id, last->book_id, sizeof(rec.book_id) - 1);
@@ -430,7 +526,16 @@ static void handle_return(PendingPool *pool, const Blockchain *chain, CopyInvent
         return;
     }
 
-    pending_pool_add(pool, &rec);
+    if (flag_reason == NULL && pending_pool_is_duplicate_request(pool, chain, rec.record_id)) {
+        flag_reason = "duplicate request_id (already seen in the pool or on-chain)";
+    }
+
+    PendingEntry *entry = pending_pool_add(pool, &rec);
+    if (flag_reason != NULL) {
+        entry->status = POOL_STATUS_SUSPICIOUS;
+        strncpy(entry->flag_reason, flag_reason, sizeof(entry->flag_reason) - 1);
+        printf("FRAUD ALERT: return request flagged SUSPICIOUS (%s) - see fraud_review.\n", flag_reason);
+    }
     storage_save_pending_pool(pool, POOL_FILE);
 
     /* BORROWED -> AVAILABLE, or RESERVED (held for the next member in
@@ -458,6 +563,10 @@ static void handle_return(PendingPool *pool, const Blockchain *chain, CopyInvent
     copy->current_holder_id[sizeof(copy->current_holder_id) - 1] = '\0';
     copy->due_date = 0;
     copy->renewal_count = 0;
+    if (condition_changed) {
+        strncpy(copy->condition, new_condition, sizeof(copy->condition) - 1);
+        copy->condition[sizeof(copy->condition) - 1] = '\0';
+    }
     save_inventory_state(inv, reservations);
 }
 
@@ -505,7 +614,14 @@ static void handle_renew_book(PendingPool *pool, const Blockchain *chain, CopyIn
         return;
     }
 
-    pending_pool_add(pool, &rec);
+    int duplicate = pending_pool_is_duplicate_request(pool, chain, rec.record_id);
+    PendingEntry *entry = pending_pool_add(pool, &rec);
+    if (duplicate) {
+        entry->status = POOL_STATUS_SUSPICIOUS;
+        strncpy(entry->flag_reason, "duplicate request_id (already seen in the pool or on-chain)",
+                sizeof(entry->flag_reason) - 1);
+        printf("FRAUD ALERT: renewal request flagged SUSPICIOUS (duplicate request_id) - see fraud_review.\n");
+    }
     storage_save_pending_pool(pool, POOL_FILE);
 
     copy->due_date = rec.due_date;
@@ -634,6 +750,60 @@ static void handle_settle_fine(FineLedger *fines) {
     storage_save_fine_ledger(fines, FINE_FILE);
     printf("OK: Settled %d for %s (remaining owed: %d)\n",
            amount, member_id, fine_ledger_owed(fines, member_id));
+}
+
+static void handle_fraud_review(const PendingPool *pool) {
+    pending_pool_print_suspicious(pool);
+}
+
+/* Clears a request's SUSPICIOUS status so the next mining round can pick
+ * it up normally - the inventory-side effect it already caused (the
+ * copy's state/condition) was applied at submission time regardless of
+ * the flag, same as any other pending request. */
+static void handle_approve_suspicious(PendingPool *pool, const char *arg) {
+    char input[32];
+    const char *id_str = arg;
+    if (id_str == NULL) {
+        printf("Request ID: ");
+        read_line(input, sizeof(input));
+        id_str = input;
+    }
+    unsigned long request_id = strtoul(id_str, NULL, 10);
+
+    PendingEntry *entry = pending_pool_find_by_request_id(pool, request_id);
+    if (entry == NULL || entry->status != POOL_STATUS_SUSPICIOUS) {
+        printf("ERROR: No flagged request with ID %lu\n", request_id);
+        return;
+    }
+
+    entry->status = POOL_STATUS_PENDING;
+    storage_save_pending_pool(pool, POOL_FILE);
+    printf("OK: Request #%lu cleared for mining.\n", request_id);
+}
+
+/* Declines a flagged request outright - it never gets mined, so it
+ * never earns a reward or counts a fine. Any inventory-side effect it
+ * already caused at submission time is not rolled back; that's a known
+ * limitation documented in the technical report, not an oversight. */
+static void handle_reject_suspicious(PendingPool *pool, const char *arg) {
+    char input[32];
+    const char *id_str = arg;
+    if (id_str == NULL) {
+        printf("Request ID: ");
+        read_line(input, sizeof(input));
+        id_str = input;
+    }
+    unsigned long request_id = strtoul(id_str, NULL, 10);
+
+    PendingEntry *entry = pending_pool_find_by_request_id(pool, request_id);
+    if (entry == NULL || entry->status != POOL_STATUS_SUSPICIOUS) {
+        printf("ERROR: No flagged request with ID %lu\n", request_id);
+        return;
+    }
+
+    pending_pool_remove_by_request_id(pool, request_id);
+    storage_save_pending_pool(pool, POOL_FILE);
+    printf("OK: Request #%lu rejected and removed from the pool.\n", request_id);
 }
 
 static void save_ledgers(TransactionModel model, UTXOSet *utxos, AccountLedger *accounts) {
@@ -901,11 +1071,19 @@ static void handle_replay_test(PendingPool *pool, const Blockchain *chain, const
         return;
     }
 
-    pending_pool_add(pool, last);
+    int duplicate = pending_pool_is_duplicate_request(pool, chain, last->record_id);
+    PendingEntry *entry = pending_pool_add(pool, last);
+    if (duplicate) {
+        entry->status = POOL_STATUS_SUSPICIOUS;
+        strncpy(entry->flag_reason, "duplicate request_id (already seen in the pool or on-chain)",
+                sizeof(entry->flag_reason) - 1);
+    }
     storage_save_pending_pool(pool, POOL_FILE);
     printf("OK: Replayed the confirmed %s record for copy '%s' (member %s, nonce %lu) back into the pool.\n",
            last->action, copy_id, last->member_id, last->nonce);
-    printf("Run mine_solo/mine_pool/mine_cloud now - it should be rejected, since that nonce is already spent.\n");
+    printf("Flagged SUSPICIOUS straight away (duplicate request_id %lu already on-chain) - see fraud_review.\n",
+           last->record_id);
+    printf("It would also be rejected on nonce grounds alone if approved and sent to mine_solo/mine_pool/mine_cloud.\n");
 }
 
 static void handle_tamper_demo(Blockchain *chain) {
@@ -1095,6 +1273,12 @@ int main(int argc, char *argv[]) {
             handle_view_fines(&fines);
         } else if (strcmp(cmd, "settle_fine") == 0) {
             handle_settle_fine(&fines);
+        } else if (strcmp(cmd, "fraud_review") == 0) {
+            handle_fraud_review(&pool);
+        } else if (strcmp(cmd, "approve_suspicious") == 0) {
+            handle_approve_suspicious(&pool, arg);
+        } else if (strcmp(cmd, "reject_suspicious") == 0) {
+            handle_reject_suspicious(&pool, arg);
         } else if (strcmp(cmd, "pool_view") == 0) {
             pending_pool_prioritize(&pool, &reservations);
             pending_pool_print(&pool);
