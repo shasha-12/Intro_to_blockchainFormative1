@@ -88,12 +88,14 @@ static void credit_miner_amount(const char *miner_id, int amount, TransactionMod
 }
 
 /* Gathers up to MAX_RECORDS_PER_BLOCK candidate records from the front
- * of the pool, but only accepts ones whose nonce matches the member's
- * current CONFIRMED nonce - the nonce only actually advances here, on
- * confirmation, never when a request merely enters the pool. A record
- * that doesn't match (e.g. two unconfirmed requests from the same
- * member racing each other, or a genuinely replayed old signed request)
- * is left behind in the pool rather than silently included. Writes the
+ * of the pool (already priority-ordered by the caller), but only accepts
+ * ones whose nonce matches the member's current CONFIRMED nonce - the
+ * nonce only actually advances here, on confirmation, never when a
+ * request merely enters the pool. A record that doesn't match (e.g. two
+ * unconfirmed requests from the same member racing each other, or a
+ * genuinely replayed old signed request) is left behind in the pool
+ * rather than silently included - as is anything flagged SUSPICIOUS,
+ * which stays out of blocks until fraud review clears it. Writes the
  * indices (into pool->entries) of every accepted record into out_indices
  * and returns how many were accepted. */
 static int gather_valid_batch(const PendingPool *pool, NonceRegistry *nonces,
@@ -104,7 +106,10 @@ static int gather_valid_batch(const PendingPool *pool, NonceRegistry *nonces,
     int projected_count = 0;
 
     for (int i = 0; i < pool->count && accepted < MAX_RECORDS_PER_BLOCK; i++) {
-        const LendingRecord *candidate = &pool->entries[i];
+        if (pool->entries[i].status == POOL_STATUS_SUSPICIOUS) {
+            continue;
+        }
+        const LendingRecord *candidate = &pool->entries[i].record;
 
         unsigned long expected = nonce_registry_get(nonces, candidate->member_id);
         for (int j = 0; j < projected_count; j++) {
@@ -206,11 +211,13 @@ static int confirm_batch(Blockchain *chain, PendingPool *pool, int difficulty,
 
 int mining_solo(Blockchain *chain, PendingPool *pool, int difficulty, const char *miner_id,
                  TransactionModel model, UTXOSet *utxos, AccountLedger *accounts, FineLedger *fines,
-                 NonceRegistry *nonces) {
+                 NonceRegistry *nonces, const ReservationQueue *reservations) {
     if (pool->count == 0) {
         printf("Pending pool is empty - nothing to mine.\n");
         return 0;
     }
+
+    pending_pool_prioritize(pool, reservations);
 
     printf("Mining %d pending record(s) at difficulty %d (miner: %s)...\n",
            pool->count, difficulty, miner_id);
@@ -249,13 +256,15 @@ int mining_solo(Blockchain *chain, PendingPool *pool, int difficulty, const char
 
 int mining_pool(Blockchain *chain, PendingPool *pool, int difficulty, int num_miners,
                  TransactionModel model, UTXOSet *utxos, AccountLedger *accounts, FineLedger *fines,
-                 NonceRegistry *nonces, PoolMinerResult *out_results) {
+                 NonceRegistry *nonces, const ReservationQueue *reservations, PoolMinerResult *out_results) {
     if (pool->count == 0) {
         printf("Pending pool is empty - nothing to mine.\n");
         return 0;
     }
     if (num_miners < 1) num_miners = 1;
     if (num_miners > MAX_POOL_MINERS) num_miners = MAX_POOL_MINERS;
+
+    pending_pool_prioritize(pool, reservations);
 
     printf("Pool mining %d pending record(s) at difficulty %d with %d miner(s)...\n",
            pool->count, difficulty, num_miners);
@@ -331,9 +340,12 @@ int mining_pool(Blockchain *chain, PendingPool *pool, int difficulty, int num_mi
 
 void mining_cloud(Blockchain *chain, PendingPool *pool, int difficulty, int rounds,
                    const char *renter_id, TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
-                   FineLedger *fines, NonceRegistry *nonces, CloudRound *out_rounds) {
+                   FineLedger *fines, NonceRegistry *nonces, const ReservationQueue *reservations,
+                   CloudRound *out_rounds) {
     if (rounds < MIN_CLOUD_ROUNDS) rounds = MIN_CLOUD_ROUNDS;
     if (rounds > MAX_CLOUD_ROUNDS) rounds = MAX_CLOUD_ROUNDS;
+
+    pending_pool_prioritize(pool, reservations);
 
     printf("Cloud mining for %d round(s), renting hash power for '%s'...\n", rounds, renter_id);
 

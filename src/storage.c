@@ -65,7 +65,9 @@ int storage_load_pending_pool(PendingPool *pool, const char *path) {
     }
 
     int count = 0;
-    if (fread(&count, sizeof(int), 1, fp) != 1 || count < 0) {
+    unsigned long next_request_id = 1;
+    if (fread(&count, sizeof(int), 1, fp) != 1 || count < 0 ||
+        fread(&next_request_id, sizeof(unsigned long), 1, fp) != 1) {
         fprintf(stderr, "ERROR: Pending pool file '%s' is corrupted (bad header)\n", path);
         fclose(fp);
         return 0;
@@ -73,10 +75,10 @@ int storage_load_pending_pool(PendingPool *pool, const char *path) {
 
     if (count > pool->capacity) {
         pool->capacity = count > 0 ? count : 1;
-        pool->entries = realloc(pool->entries, sizeof(LendingRecord) * (size_t)pool->capacity);
+        pool->entries = realloc(pool->entries, sizeof(PendingEntry) * (size_t)pool->capacity);
     }
 
-    if (count > 0 && fread(pool->entries, sizeof(LendingRecord), (size_t)count, fp) != (size_t)count) {
+    if (count > 0 && fread(pool->entries, sizeof(PendingEntry), (size_t)count, fp) != (size_t)count) {
         fprintf(stderr, "ERROR: Pending pool file '%s' is corrupted (truncated data)\n", path);
         fclose(fp);
         pool->count = 0;
@@ -84,6 +86,7 @@ int storage_load_pending_pool(PendingPool *pool, const char *path) {
     }
 
     pool->count = count;
+    pool->next_request_id = next_request_id;
     fclose(fp);
     return 1;
 }
@@ -96,8 +99,9 @@ int storage_save_pending_pool(const PendingPool *pool, const char *path) {
     }
 
     int ok = fwrite(&pool->count, sizeof(int), 1, fp) == 1;
+    ok = ok && fwrite(&pool->next_request_id, sizeof(unsigned long), 1, fp) == 1;
     if (ok && pool->count > 0) {
-        ok = fwrite(pool->entries, sizeof(LendingRecord), (size_t)pool->count, fp) == (size_t)pool->count;
+        ok = fwrite(pool->entries, sizeof(PendingEntry), (size_t)pool->count, fp) == (size_t)pool->count;
     }
 
     fclose(fp);

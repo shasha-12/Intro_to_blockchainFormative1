@@ -129,7 +129,7 @@ static unsigned long next_assignable_nonce(const PendingPool *pool, NonceRegistr
                                             const char *member_id) {
     unsigned long n = nonce_registry_get(nonces, member_id);
     for (int i = 0; i < pool->count; i++) {
-        if (strcmp(pool->entries[i].member_id, member_id) == 0) {
+        if (strcmp(pool->entries[i].record.member_id, member_id) == 0) {
             n++;
         }
     }
@@ -564,9 +564,9 @@ static void handle_check_overdue(PendingPool *pool, const Blockchain *chain, Cop
 
         LendingRecord *existing = NULL;
         for (int j = 0; j < pool->count; j++) {
-            if (strcmp(pool->entries[j].copy_id, c->copy_id) == 0 &&
-                strcmp(pool->entries[j].action, ACTION_OVERDUE) == 0) {
-                existing = &pool->entries[j];
+            if (strcmp(pool->entries[j].record.copy_id, c->copy_id) == 0 &&
+                strcmp(pool->entries[j].record.action, ACTION_OVERDUE) == 0) {
+                existing = &pool->entries[j].record;
                 break;
             }
         }
@@ -657,7 +657,7 @@ static void print_ledger_state(TransactionModel model, UTXOSet *utxos, AccountLe
 
 static void handle_mine_solo(Blockchain *chain, PendingPool *pool, int difficulty,
                               TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
-                              FineLedger *fines, NonceRegistry *nonces) {
+                              FineLedger *fines, NonceRegistry *nonces, const ReservationQueue *reservations) {
     char miner_id[50];
     printf("Enter Miner ID: ");
     read_line(miner_id, sizeof(miner_id));
@@ -665,7 +665,7 @@ static void handle_mine_solo(Blockchain *chain, PendingPool *pool, int difficult
         strcpy(miner_id, "MINER1");
     }
 
-    mining_solo(chain, pool, difficulty, miner_id, model, utxos, accounts, fines, nonces);
+    mining_solo(chain, pool, difficulty, miner_id, model, utxos, accounts, fines, nonces, reservations);
 
     storage_save_chain(chain, CHAIN_FILE);
     storage_save_pending_pool(pool, POOL_FILE);
@@ -677,14 +677,14 @@ static void handle_mine_solo(Blockchain *chain, PendingPool *pool, int difficult
 
 static void handle_mine_pool(Blockchain *chain, PendingPool *pool, int difficulty,
                               TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
-                              FineLedger *fines, NonceRegistry *nonces) {
+                              FineLedger *fines, NonceRegistry *nonces, const ReservationQueue *reservations) {
     char input[16];
     printf("Number of pool miners (%d-%d, default %d): ", 1, MAX_POOL_MINERS, DEFAULT_POOL_MINERS);
     read_line(input, sizeof(input));
     int num_miners = input[0] == '\0' ? DEFAULT_POOL_MINERS : atoi(input);
 
     PoolMinerResult results[MAX_POOL_MINERS];
-    mining_pool(chain, pool, difficulty, num_miners, model, utxos, accounts, fines, nonces, results);
+    mining_pool(chain, pool, difficulty, num_miners, model, utxos, accounts, fines, nonces, reservations, results);
 
     storage_save_chain(chain, CHAIN_FILE);
     storage_save_pending_pool(pool, POOL_FILE);
@@ -696,7 +696,8 @@ static void handle_mine_pool(Blockchain *chain, PendingPool *pool, int difficult
 
 static void handle_mine_cloud(Blockchain *chain, PendingPool *pool, int difficulty,
                                TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
-                               FineLedger *fines, NonceRegistry *nonces, const char *arg) {
+                               FineLedger *fines, NonceRegistry *nonces, const ReservationQueue *reservations,
+                               const char *arg) {
     char renter_id[50], input[16];
     printf("Enter Renter ID: ");
     read_line(renter_id, sizeof(renter_id));
@@ -714,7 +715,8 @@ static void handle_mine_cloud(Blockchain *chain, PendingPool *pool, int difficul
     }
 
     CloudRound rounds_out[MAX_CLOUD_ROUNDS];
-    mining_cloud(chain, pool, difficulty, rounds, renter_id, model, utxos, accounts, fines, nonces, rounds_out);
+    mining_cloud(chain, pool, difficulty, rounds, renter_id, model, utxos, accounts, fines, nonces,
+                 reservations, rounds_out);
 
     storage_save_chain(chain, CHAIN_FILE);
     storage_save_pending_pool(pool, POOL_FILE);
@@ -1094,13 +1096,14 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(cmd, "settle_fine") == 0) {
             handle_settle_fine(&fines);
         } else if (strcmp(cmd, "pool_view") == 0) {
+            pending_pool_prioritize(&pool, &reservations);
             pending_pool_print(&pool);
         } else if (strcmp(cmd, "mine_solo") == 0) {
-            handle_mine_solo(&chain, &pool, difficulty, model, &utxos, &accounts, &fines, &nonces);
+            handle_mine_solo(&chain, &pool, difficulty, model, &utxos, &accounts, &fines, &nonces, &reservations);
         } else if (strcmp(cmd, "mine_pool") == 0) {
-            handle_mine_pool(&chain, &pool, difficulty, model, &utxos, &accounts, &fines, &nonces);
+            handle_mine_pool(&chain, &pool, difficulty, model, &utxos, &accounts, &fines, &nonces, &reservations);
         } else if (strcmp(cmd, "mine_cloud") == 0) {
-            handle_mine_cloud(&chain, &pool, difficulty, model, &utxos, &accounts, &fines, &nonces, arg);
+            handle_mine_cloud(&chain, &pool, difficulty, model, &utxos, &accounts, &fines, &nonces, &reservations, arg);
         } else if (strcmp(cmd, "difficulty_status") == 0) {
             printf("Current mining difficulty: %d (range %d-%d)\n", difficulty, MIN_DIFFICULTY, MAX_DIFFICULTY);
         } else if (strcmp(cmd, "set_difficulty") == 0) {
