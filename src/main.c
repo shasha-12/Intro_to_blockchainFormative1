@@ -75,8 +75,9 @@ static int read_line(char *buf, size_t size) {
 /* Splits one input line into a command word and whatever (optionally
  * empty) trailing argument follows it, e.g. "mine_cloud 3" -> cmd=
  * "mine_cloud", arg="3". Commands that take their argument inline
- * (mine_cloud, transaction_history, mark_lost) use arg directly if
- * present and prompt for it otherwise. */
+ * (mine_cloud, transaction_history, mark_lost, member_history,
+ * book_history) use arg directly if present and prompt for it
+ * otherwise. */
 static void split_command(char *line, char **cmd, char **arg) {
     *cmd = line;
     *arg = NULL;
@@ -100,6 +101,7 @@ static void print_commands(int difficulty, TransactionModel model) {
     printf("Pool/Mining:  pool_view  mine_solo  mine_pool  mine_cloud <rounds>\n");
     printf("              difficulty_status  set_difficulty\n");
     printf("Chain:        chain_view  validate_chain  chain_save  chain_load  tamper_block  replay_test\n");
+    printf("Audit:        lending_history  member_history <id>  book_history <id>\n");
     printf("Tokens:       utxo_view  token_transfer  token_balance  credit_test_utxo\n");
     printf("              account_balance  account_transfer  account_nonce\n");
     printf("              transaction_history <member_id>  credit_test_account\n");
@@ -1117,6 +1119,85 @@ static void handle_tamper_demo(Blockchain *chain) {
     printf("Block %d modified in memory and on disk. Run 'validate_chain' to see it detected.\n", idx);
 }
 
+static void print_history_line(const LendingRecord *r, const char *label) {
+    char ts[32];
+    struct tm *tm_info = localtime(&r->timestamp);
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm_info);
+    printf("[%-10s] %-9s %s (%s / copy %s) by %s (%s) at %s",
+           label, r->action, r->book_title, r->book_id, r->copy_id, r->member_name, r->member_id, ts);
+    if (r->fine_amount > 0) {
+        printf(" - fine %d", r->fine_amount);
+    }
+    printf("\n");
+}
+
+/* Shared by lending_history/member_history/book_history - a NULL filter
+ * matches everything. Confirmed records are listed chain order first,
+ * then whatever's still sitting in the pool (PENDING or SUSPICIOUS), so
+ * the full picture of a member or title's activity is in one place. */
+static void print_lending_history(const Blockchain *chain, const PendingPool *pool,
+                                   const char *member_filter, const char *book_filter) {
+    int shown = 0;
+    for (int bi = 1; bi < chain->count; bi++) {
+        const Block *b = &chain->blocks[bi];
+        for (int ri = 0; ri < b->record_count; ri++) {
+            const LendingRecord *r = &b->records[ri];
+            if (member_filter != NULL && strcmp(r->member_id, member_filter) != 0) continue;
+            if (book_filter != NULL && strcmp(r->book_id, book_filter) != 0) continue;
+            print_history_line(r, "CONFIRMED");
+            shown++;
+        }
+    }
+    for (int i = 0; i < pool->count; i++) {
+        const PendingEntry *e = &pool->entries[i];
+        if (member_filter != NULL && strcmp(e->record.member_id, member_filter) != 0) continue;
+        if (book_filter != NULL && strcmp(e->record.book_id, book_filter) != 0) continue;
+        print_history_line(&e->record, e->status == POOL_STATUS_SUSPICIOUS ? "SUSPICIOUS" : "PENDING");
+        shown++;
+    }
+    if (shown == 0) {
+        printf("No lending history found.\n");
+    }
+}
+
+static void handle_lending_history(const Blockchain *chain, const PendingPool *pool) {
+    print_lending_history(chain, pool, NULL, NULL);
+}
+
+static void handle_member_history(const Blockchain *chain, const PendingPool *pool,
+                                   const Registry *reg, const char *arg) {
+    char member_id[20];
+    if (arg != NULL) {
+        strncpy(member_id, arg, sizeof(member_id) - 1);
+        member_id[sizeof(member_id) - 1] = '\0';
+    } else {
+        printf("Member ID: ");
+        read_line(member_id, sizeof(member_id));
+    }
+    if (registry_find_member(reg, member_id) == NULL) {
+        printf("ERROR: Member '%s' not found\n", member_id);
+        return;
+    }
+    print_lending_history(chain, pool, member_id, NULL);
+}
+
+static void handle_book_history(const Blockchain *chain, const PendingPool *pool,
+                                 const Registry *reg, const char *arg) {
+    char book_id[20];
+    if (arg != NULL) {
+        strncpy(book_id, arg, sizeof(book_id) - 1);
+        book_id[sizeof(book_id) - 1] = '\0';
+    } else {
+        printf("Book ID: ");
+        read_line(book_id, sizeof(book_id));
+    }
+    if (registry_find_book(reg, book_id) == NULL) {
+        printf("ERROR: Book '%s' not found\n", book_id);
+        return;
+    }
+    print_lending_history(chain, pool, NULL, book_id);
+}
+
 int main(int argc, char *argv[]) {
     int difficulty = DEFAULT_DIFFICULTY;
     TransactionModel model = MODEL_UTXO;
@@ -1311,6 +1392,12 @@ int main(int argc, char *argv[]) {
             handle_tamper_demo(&chain);
         } else if (strcmp(cmd, "replay_test") == 0) {
             handle_replay_test(&pool, &chain, arg);
+        } else if (strcmp(cmd, "lending_history") == 0) {
+            handle_lending_history(&chain, &pool);
+        } else if (strcmp(cmd, "member_history") == 0) {
+            handle_member_history(&chain, &pool, &reg, arg);
+        } else if (strcmp(cmd, "book_history") == 0) {
+            handle_book_history(&chain, &pool, &reg, arg);
         } else if (strcmp(cmd, "utxo_view") == 0) {
             utxo_print_set(&utxos);
         } else if (strcmp(cmd, "token_transfer") == 0) {
