@@ -153,7 +153,11 @@ static const char *format_timestamp(time_t ts, char *out, size_t out_size) {
 }
 
 static const char *status_label(PoolEntryStatus status) {
-    return status == POOL_STATUS_SUSPICIOUS ? "SUSPICIOUS" : "PENDING";
+    switch (status) {
+        case POOL_STATUS_SUSPICIOUS: return "SUSPICIOUS";
+        case POOL_STATUS_CONFIRMED: return "CONFIRMED";
+        default: return "PENDING";
+    }
 }
 
 void pending_pool_print_suspicious(const PendingPool *pool) {

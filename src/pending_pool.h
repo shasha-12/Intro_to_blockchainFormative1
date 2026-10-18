@@ -6,6 +6,7 @@
 
 typedef enum {
     POOL_STATUS_PENDING,
+    POOL_STATUS_CONFIRMED,
     POOL_STATUS_SUSPICIOUS,
 } PoolEntryStatus;
 

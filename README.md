@@ -25,11 +25,22 @@ branch is where the combined system and its extensions live.
   A block's `merkle_root` is built from scratch (no external library)
   over all of its records, with each leaf hash covering the record's
   own signature, so forging a signature also breaks the root.
-- `validate_chain` recomputes every block's hash, hash link, and Merkle
-  root, and verifies every record's signature against its own signer.
-- `tamper_block` mutates a past record in place (no re-sign) so
-  `validate_chain` can be shown catching it - both the hash and the
-  Merkle root mismatch, proving the per-record layer is doing real work.
+- `validate_chain` recomputes every block's hash, hash link, Merkle root,
+  stored proof-of-work target, strictly-increasing timestamp, and every
+  record's signature against its own signer. It also runs automatically
+  once at startup, before any command is accepted that session.
+- `tamper_block` clones the chain, tampers and validates only that copy
+  (no re-sign), and prints the result right there - the real chain and
+  `chain.dat` are never touched, so `validate_chain` run afterward still
+  reports VALID. The stored block hash stays internally consistent on
+  the clone too (it's a function of the header, which tampering a
+  record never touches), but the Merkle root recomputed from the
+  current records and the record's own signature both fail, proving
+  those two checks are doing the real work of catching a record-level
+  edit.
+- Every record's signature is re-verified a second time at mining time,
+  inside `gather_valid_batch`, right before it would be sealed into a
+  block - not just later when `validate_chain` reads the chain back.
 
 **Copy inventory & reservations**
 - Physical copies (`copies.txt`) are tracked individually, each with its
@@ -52,7 +63,9 @@ branch is where the combined system and its extensions live.
 - Every member has their own ECDSA (P-256) keypair, generated the first
   time they're looked up and reused from `keys/members/` after that -
   replacing the single shared librarian key Formative 1/2 used for
-  everything. `register_member` / `view_member` manage this.
+  everything. `register_member` / `view_member` manage this. The private
+  key file itself is AES-256 encrypted at rest (a PKCS8 "ENCRYPTED
+  PRIVATE KEY" block, not plain PEM).
 - A `NonceRegistry` tracks each member's *confirmed* nonce - it only
   advances when a request is actually mined. New requests are assigned
   `confirmed nonce + that member's own pending request count`, so two of
@@ -105,12 +118,12 @@ multi-record blocks)**
 
 **Persistence**
 - Chain, pending pool, UTXO set, account ledger, copy inventory,
-  reservation queue, fine ledger, and the nonce registry all survive a
-  restart (`chain.dat`, `pending_pool.dat`, `utxo_set.dat`,
-  `account_ledger.dat`, `copy_inventory.dat`, `reservation_queue.dat`,
-  `fine_ledger.dat`, `nonce_registry.dat`). Per-account transaction
-  *history* is intentionally in-memory only, per the assignment's own
-  description of it as such.
+  reservation queue, fine ledger, nonce registry, and the current mining
+  difficulty all survive a restart (`chain.dat`, `pending_pool.dat`,
+  `utxo_set.dat`, `account_ledger.dat`, `copy_inventory.dat`,
+  `reservation_queue.dat`, `fine_ledger.dat`, `nonce_registry.dat`,
+  `difficulty.dat`). Per-account transaction *history* is intentionally
+  in-memory only, per the assignment's own description of it as such.
 - Member keypairs are generated lazily and reused from `keys/members/`.
 
 > **Simulated time scales:** a 15-second loan period, 15-second renewal
@@ -174,9 +187,11 @@ On first run the program will:
    via `copy_inventory.dat`).
 3. Create a genesis block and persist the chain to `chain.dat` (reused on
    later runs), along with any pending pool / ledger / reservation /
-   fine / nonce state from a previous session.
-4. Run an automatic overdue check.
-5. Prompt for a transaction model (UTXO or account-based) unless one was
+   fine / nonce / difficulty state from a previous session.
+4. Validate the loaded chain automatically (same checks as
+   `validate_chain`) before accepting any command.
+5. Run an automatic overdue check.
+6. Prompt for a transaction model (UTXO or account-based) unless one was
    given via `--model` - this choice is locked for the rest of the
    session.
 
@@ -245,7 +260,8 @@ Either `--difficulty N` at startup, or `set_difficulty` at any time
 (1-4, default 2). Higher difficulty means more leading zero hex
 characters required in a block's hash, which means more proof-of-work
 attempts on average - all three mining commands use whatever difficulty
-is currently set (`difficulty_status` shows it).
+is currently set (`difficulty_status` shows it). The difficulty persists
+across restarts (`difficulty.dat`) unless overridden by `--difficulty`.
 
 ## File layout
 
@@ -276,11 +292,11 @@ keys/members/         Generated per-member ECDSA keypairs (gitignored)
 ```bash
 rm -f chain.dat pending_pool.dat utxo_set.dat account_ledger.dat \
       copy_inventory.dat reservation_queue.dat fine_ledger.dat \
-      nonce_registry.dat
+      nonce_registry.dat difficulty.dat
 rm -rf keys/members
 ```
 
 This wipes the persisted chain, pending pool, both ledgers, the copy
-inventory/reservations/fines, the nonce registry, and every generated
-member keypair, so the next run starts completely fresh from
-`books.txt` / `members.txt` / `copies.txt`.
+inventory/reservations/fines, the nonce registry, the saved difficulty,
+and every generated member keypair, so the next run starts completely
+fresh from `books.txt` / `members.txt` / `copies.txt`.

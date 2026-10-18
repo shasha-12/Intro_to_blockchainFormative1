@@ -358,3 +358,19 @@ int storage_save_nonce_registry(const NonceRegistry *reg, const char *path) {
     fclose(fp);
     return ok;
 }
+
+int storage_load_difficulty(int *difficulty, const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) return 0;
+    int ok = fread(difficulty, sizeof(int), 1, fp) == 1;
+    fclose(fp);
+    return ok;
+}
+
+int storage_save_difficulty(int difficulty, const char *path) {
+    FILE *fp = fopen(path, "wb");
+    if (fp == NULL) return 0;
+    int ok = fwrite(&difficulty, sizeof(int), 1, fp) == 1;
+    fclose(fp);
+    return ok;
+}

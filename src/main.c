@@ -26,6 +26,7 @@
 #define RESERVATION_FILE "reservation_queue.dat"
 #define FINE_FILE "fine_ledger.dat"
 #define NONCE_FILE "nonce_registry.dat"
+#define DIFFICULTY_FILE "difficulty.dat"
 #define NETWORK_ACCOUNT "NETWORK"
 
 /* A book borrowed now is due this many seconds later, and each renewal
@@ -72,12 +73,19 @@ static int read_line(char *buf, size_t size) {
     return 1;
 }
 
-/* Splits one input line into a command word and whatever (optionally
- * empty) trailing argument follows it, e.g. "mine_cloud 3" -> cmd=
- * "mine_cloud", arg="3". Commands that take their argument inline
- * (mine_cloud, transaction_history, mark_lost, member_history,
- * book_history) use arg directly if present and prompt for it
- * otherwise. */
+/* True if s is empty or contains nothing but spaces - used to reject a
+ * blank ID at registration, since an empty string isn't a valid book,
+ * member, or copy ID even though no registry lookup would ever match
+ * one, so nothing else in the code naturally rejects it. */
+static int is_blank(const char *s) {
+    for (; *s != '\0'; s++) {
+        if (*s != ' ') return 0;
+    }
+    return 1;
+}
+
+/* Splits one input line into a command word and an optional trailing
+ * argument, e.g. "mine_cloud 3" -> cmd="mine_cloud", arg="3". */
 static void split_command(char *line, char **cmd, char **arg) {
     *cmd = line;
     *arg = NULL;
@@ -186,6 +194,10 @@ static void handle_register_member(Registry *reg, MemberKeyStore *keys) {
     printf("Course Code: ");
     read_line(course_code, sizeof(course_code));
 
+    if (is_blank(member_id) || is_blank(full_name)) {
+        printf("ERROR: Member ID and full name cannot be blank\n");
+        return;
+    }
     if (registry_find_member(reg, member_id) != NULL) {
         printf("ERROR: Member ID '%s' already exists\n", member_id);
         return;
@@ -201,9 +213,6 @@ static void handle_register_member(Registry *reg, MemberKeyStore *keys) {
     strncpy(m->course_code, course_code, sizeof(m->course_code) - 1);
     reg->member_count++;
 
-    /* Generating the keypair immediately (rather than waiting for their
-     * first request) means a brand new member already has an on-chain
-     * identity the moment they're registered. */
     if (member_key_store_get(keys, member_id) == NULL) {
         printf("WARNING: Member registered, but keypair generation failed\n");
         return;
@@ -240,6 +249,10 @@ static void handle_register_book(Registry *reg) {
     printf("Author: ");
     read_line(author, sizeof(author));
 
+    if (is_blank(book_id) || is_blank(title)) {
+        printf("ERROR: Book ID and title cannot be blank\n");
+        return;
+    }
     if (registry_find_book(reg, book_id) != NULL) {
         printf("ERROR: Book ID '%s' already exists\n", book_id);
         return;
@@ -278,6 +291,15 @@ static void handle_add_copy(CopyInventory *inv, ReservationQueue *q, const Regis
     printf("Condition (NEW/GOOD/WORN): ");
     read_line(condition, sizeof(condition));
 
+    if (is_blank(copy_id)) {
+        printf("ERROR: Copy ID cannot be blank\n");
+        return;
+    }
+    if (strcmp(condition, CONDITION_NEW) != 0 && strcmp(condition, CONDITION_GOOD) != 0 &&
+        strcmp(condition, CONDITION_WORN) != 0) {
+        printf("ERROR: Condition must be one of NEW, GOOD, WORN\n");
+        return;
+    }
     if (registry_find_book(reg, book_id) == NULL) {
         printf("ERROR: Book '%s' not found\n", book_id);
         return;
@@ -293,9 +315,6 @@ static void handle_add_copy(CopyInventory *inv, ReservationQueue *q, const Regis
     strncpy(c.condition, condition, sizeof(c.condition) - 1);
     strncpy(c.state, COPY_STATE_AVAILABLE, sizeof(c.state) - 1);
 
-    /* Reuses the inventory's own growable array by going through find()
-     * after a manual append would be circular, so this mirrors
-     * copy_inventory_load's insertion instead. */
     if (inv->count >= inv->capacity) {
         inv->capacity *= 2;
         inv->copies = realloc(inv->copies, sizeof(Copy) * (size_t)inv->capacity);
@@ -352,6 +371,10 @@ static void handle_mark_lost(CopyInventory *inv, ReservationQueue *q, const char
 
     strncpy(c->state, COPY_STATE_LOST, sizeof(c->state) - 1);
     c->state[sizeof(c->state) - 1] = '\0';
+    /* condition also moves to LOST, not just state - the brief lists
+     * LOST as one of the valid values for both fields. */
+    strncpy(c->condition, "LOST", sizeof(c->condition) - 1);
+    c->condition[sizeof(c->condition) - 1] = '\0';
     save_inventory_state(inv, q);
     printf("OK: Copy '%s' marked LOST (reason: %s)\n", copy_id, reason);
 }
@@ -540,8 +563,6 @@ static void handle_return(PendingPool *pool, const Blockchain *chain, CopyInvent
     }
     storage_save_pending_pool(pool, POOL_FILE);
 
-    /* BORROWED -> AVAILABLE, or RESERVED (held for the next member in
-     * line) if anyone is waiting for this title. */
     char fine_note[32] = "";
     if (rec.fine_amount > 0) {
         snprintf(fine_note, sizeof(fine_note), ", fine %d", rec.fine_amount);
@@ -634,14 +655,18 @@ static void handle_renew_book(PendingPool *pool, const Blockchain *chain, CopyIn
            copy_id, copy->renewal_count, MAX_RENEWALS);
 }
 
-static void handle_reserve_book(const Registry *reg, CopyInventory *inv, ReservationQueue *reservations) {
+static void handle_reserve_book(const Registry *reg, CopyInventory *inv, ReservationQueue *reservations,
+                                 PendingPool *pool, const Blockchain *chain, MemberKeyStore *keys,
+                                 NonceRegistry *nonces) {
     char book_id[20], member_id[20];
     printf("Book ID: ");
     read_line(book_id, sizeof(book_id));
     printf("Member ID: ");
     read_line(member_id, sizeof(member_id));
 
-    if (registry_find_book(reg, book_id) == NULL || registry_find_member(reg, member_id) == NULL) {
+    const Book *book = registry_find_book(reg, book_id);
+    const Member *member = registry_find_member(reg, member_id);
+    if (book == NULL || member == NULL) {
         printf("ERROR: Book or Member not found\n");
         return;
     }
@@ -652,6 +677,27 @@ static void handle_reserve_book(const Registry *reg, CopyInventory *inv, Reserva
 
     reservation_queue_add(reservations, book_id, member_id);
     save_inventory_state(inv, reservations);
+
+    /* The reservation queue entry above is what actually drives the
+     * FIFO/offer mechanics; this is just a signed, mined audit record of
+     * the request itself - RESERVED is one of the action values the
+     * brief defines for a LendingRecord. No specific copy exists yet,
+     * so copy_id and due_date stay blank/zero. */
+    LendingRecord rec = {0};
+    rec.record_id = next_record_id(chain, pool);
+    strncpy(rec.book_id, book->book_id, sizeof(rec.book_id) - 1);
+    strncpy(rec.book_title, book->title, sizeof(rec.book_title) - 1);
+    strncpy(rec.member_id, member->member_id, sizeof(rec.member_id) - 1);
+    strncpy(rec.member_name, member->full_name, sizeof(rec.member_name) - 1);
+    strncpy(rec.action, ACTION_RESERVED, sizeof(rec.action) - 1);
+    rec.timestamp = time(NULL);
+    rec.nonce = next_assignable_nonce(pool, nonces, member->member_id);
+
+    if (blockchain_sign_record(&rec, member_key_store_get(keys, member->member_id))) {
+        pending_pool_add(pool, &rec);
+        storage_save_pending_pool(pool, POOL_FILE);
+    }
+
     printf("OK: %s added to the reservation queue for '%s'\n", member_id, book_id);
 }
 
@@ -659,13 +705,10 @@ static void handle_reservation_status(const ReservationQueue *reservations) {
     reservation_queue_print(reservations);
 }
 
-/* Scans every currently-BORROWED copy for a due_date that's passed, and
- * either creates a new pending OVERDUE record or - if that copy is
- * already flagged and still sitting unconfirmed in the pool - updates
- * the fine in place, since more simulated days may have passed since it
- * was first flagged. Re-signing after mutating a pending record is
- * required: the signature covers fine_amount and timestamp, both of
- * which just changed. */
+/* Scans every currently-BORROWED copy for a passed due_date, creating a
+ * new pending OVERDUE record or, if one's already flagged, updating its
+ * fine and re-signing (the signature covers fine_amount and timestamp,
+ * both of which just changed). */
 static void handle_check_overdue(PendingPool *pool, const Blockchain *chain, CopyInventory *inv,
                                   MemberKeyStore *keys, NonceRegistry *nonces) {
     time_t now = time(NULL);
@@ -829,7 +872,8 @@ static void print_ledger_state(TransactionModel model, UTXOSet *utxos, AccountLe
 
 static void handle_mine_solo(Blockchain *chain, PendingPool *pool, int difficulty,
                               TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
-                              FineLedger *fines, NonceRegistry *nonces, const ReservationQueue *reservations) {
+                              FineLedger *fines, NonceRegistry *nonces, const ReservationQueue *reservations,
+                              MemberKeyStore *keys) {
     char miner_id[50];
     printf("Enter Miner ID: ");
     read_line(miner_id, sizeof(miner_id));
@@ -837,7 +881,7 @@ static void handle_mine_solo(Blockchain *chain, PendingPool *pool, int difficult
         strcpy(miner_id, "MINER1");
     }
 
-    mining_solo(chain, pool, difficulty, miner_id, model, utxos, accounts, fines, nonces, reservations);
+    mining_solo(chain, pool, difficulty, miner_id, model, utxos, accounts, fines, nonces, reservations, keys);
 
     storage_save_chain(chain, CHAIN_FILE);
     storage_save_pending_pool(pool, POOL_FILE);
@@ -849,14 +893,16 @@ static void handle_mine_solo(Blockchain *chain, PendingPool *pool, int difficult
 
 static void handle_mine_pool(Blockchain *chain, PendingPool *pool, int difficulty,
                               TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
-                              FineLedger *fines, NonceRegistry *nonces, const ReservationQueue *reservations) {
+                              FineLedger *fines, NonceRegistry *nonces, const ReservationQueue *reservations,
+                              MemberKeyStore *keys) {
     char input[16];
     printf("Number of pool miners (%d-%d, default %d): ", 1, MAX_POOL_MINERS, DEFAULT_POOL_MINERS);
     read_line(input, sizeof(input));
     int num_miners = input[0] == '\0' ? DEFAULT_POOL_MINERS : atoi(input);
 
     PoolMinerResult results[MAX_POOL_MINERS];
-    mining_pool(chain, pool, difficulty, num_miners, model, utxos, accounts, fines, nonces, reservations, results);
+    mining_pool(chain, pool, difficulty, num_miners, model, utxos, accounts, fines, nonces, reservations,
+                keys, results);
 
     storage_save_chain(chain, CHAIN_FILE);
     storage_save_pending_pool(pool, POOL_FILE);
@@ -869,7 +915,7 @@ static void handle_mine_pool(Blockchain *chain, PendingPool *pool, int difficult
 static void handle_mine_cloud(Blockchain *chain, PendingPool *pool, int difficulty,
                                TransactionModel model, UTXOSet *utxos, AccountLedger *accounts,
                                FineLedger *fines, NonceRegistry *nonces, const ReservationQueue *reservations,
-                               const char *arg) {
+                               MemberKeyStore *keys, const char *arg) {
     char renter_id[50], input[16];
     printf("Enter Renter ID: ");
     read_line(renter_id, sizeof(renter_id));
@@ -888,7 +934,7 @@ static void handle_mine_cloud(Blockchain *chain, PendingPool *pool, int difficul
 
     CloudRound rounds_out[MAX_CLOUD_ROUNDS];
     mining_cloud(chain, pool, difficulty, rounds, renter_id, model, utxos, accounts, fines, nonces,
-                 reservations, rounds_out);
+                 reservations, keys, rounds_out);
 
     storage_save_chain(chain, CHAIN_FILE);
     storage_save_pending_pool(pool, POOL_FILE);
@@ -1028,8 +1074,6 @@ static void handle_account_history(AccountLedger *ledger, const char *arg) {
     account_print_history(ledger, member_id);
 }
 
-/* A manual test utility, same purpose as handle_utxo_credit_test but for
- * the account model. */
 static void handle_account_credit_test(AccountLedger *ledger) {
     char member_id[20], input[16];
     printf("Credit which member ID: ");
@@ -1048,15 +1092,10 @@ static void handle_account_credit_test(AccountLedger *ledger) {
            amount, member_id, ACCOUNT_FEE, NETWORK_ACCOUNT);
 }
 
-/* A dev/test hook, same purpose as credit_test_utxo/credit_test_account:
- * nonce rejection is designed to never trigger during normal legitimate
- * use (next_assignable_nonce already prevents a member's own requests
- * from colliding), so the only way to actually show it happening is to
- * simulate what an attacker would do - replay an already-confirmed,
- * genuinely validly-signed record back into the pool with its now-stale
- * nonce. The signature still verifies fine (nothing about the record
- * itself changed), which is exactly why the nonce check, not the
- * signature check, is what has to catch this. */
+/* A dev/test hook: legitimate use never produces a nonce collision
+ * (next_assignable_nonce prevents it), so the only way to demonstrate
+ * replay rejection is to simulate it directly - resubmit an
+ * already-confirmed, genuinely signed record with its now-stale nonce. */
 static void handle_replay_test(PendingPool *pool, const Blockchain *chain, const char *arg) {
     char copy_id[20];
     if (arg != NULL) {
@@ -1088,7 +1127,11 @@ static void handle_replay_test(PendingPool *pool, const Blockchain *chain, const
     printf("It would also be rejected on nonce grounds alone if approved and sent to mine_solo/mine_pool/mine_cloud.\n");
 }
 
-static void handle_tamper_demo(Blockchain *chain) {
+/* Tampers and validates a throwaway clone of the chain, never the real
+ * one - the real chain in memory and chain.dat on disk are both left
+ * exactly as they were. Run validate_chain afterward and it still
+ * reports VALID, proving the demo didn't touch anything real. */
+static void handle_tamper_demo(const Blockchain *chain, MemberKeyStore *keys) {
     int tamperable = 0;
     for (int i = 1; i < chain->count; i++) {
         if (chain->blocks[i].record_count > 0) tamperable = 1;
@@ -1108,15 +1151,23 @@ static void handle_tamper_demo(Blockchain *chain) {
         return;
     }
 
-    Block *b = &chain->blocks[idx];
-    LendingRecord *rec = &b->records[0];
-    printf("Tampering with block %d, record 0: book_title '%s' -> 'TAMPERED RECORD' (without re-signing, hash/merkle root left stale)\n",
+    Blockchain copy;
+    blockchain_clone(chain, &copy);
+
+    LendingRecord *rec = &copy.blocks[idx].records[0];
+    printf("Tampering with a throwaway copy of the chain - block %d, record 0: book_title '%s' -> 'TAMPERED RECORD' "
+           "(without re-signing, hash/merkle root left stale). The real chain and chain.dat are not touched.\n",
            idx, rec->book_title);
     strncpy(rec->book_title, "TAMPERED RECORD", sizeof(rec->book_title) - 1);
     rec->book_title[sizeof(rec->book_title) - 1] = '\0';
 
-    storage_save_chain(chain, CHAIN_FILE);
-    printf("Block %d modified in memory and on disk. Run 'validate_chain' to see it detected.\n", idx);
+    printf("Validating the tampered copy:\n");
+    int valid = blockchain_validate(&copy, keys);
+    printf(valid ? "Chain is VALID — no tampering detected.\n"
+                 : "Chain is INVALID — tampering detected!\n");
+    printf("(That was the copy. The real chain is untouched - validate_chain will still show it VALID.)\n");
+
+    blockchain_free(&copy);
 }
 
 static void print_history_line(const LendingRecord *r, const char *label) {
@@ -1202,12 +1253,14 @@ int main(int argc, char *argv[]) {
     int difficulty = DEFAULT_DIFFICULTY;
     TransactionModel model = MODEL_UTXO;
     int model_set_by_arg = 0;
+    int difficulty_set_by_arg = 0;
 
     for (int i = 1; i < argc - 1; i++) {
         if (strcmp(argv[i], "--difficulty") == 0) {
             int value = atoi(argv[i + 1]);
             if (value >= MIN_DIFFICULTY && value <= MAX_DIFFICULTY) {
                 difficulty = value;
+                difficulty_set_by_arg = 1;
             } else {
                 fprintf(stderr, "WARNING: --difficulty must be %d-%d, ignoring '%s'\n",
                         MIN_DIFFICULTY, MAX_DIFFICULTY, argv[i + 1]);
@@ -1228,6 +1281,14 @@ int main(int argc, char *argv[]) {
 
     srand((unsigned int)time(NULL));
 
+    /* Difficulty is session metadata the brief requires persisted across
+     * restarts - an explicit --difficulty flag always wins, otherwise the
+     * last saved value is restored instead of silently resetting to the
+     * default. */
+    if (!difficulty_set_by_arg) {
+        storage_load_difficulty(&difficulty, DIFFICULTY_FILE);
+    }
+
     Registry reg;
     if (!registry_load(&reg, BOOKS_FILE, MEMBERS_FILE)) {
         fprintf(stderr, "FATAL: Could not start — book/member registries missing or empty.\n");
@@ -1235,10 +1296,6 @@ int main(int argc, char *argv[]) {
     }
     printf("Loaded %d books and %d members.\n", reg.book_count, reg.member_count);
 
-    /* Formative 1/2 used one shared librarian keypair to sign everything.
-     * The summative requires every member to have their own identity, so
-     * each member's key is generated lazily, the first time they're
-     * looked up, and reused from keys/members/ on every later run. */
     MemberKeyStore member_keys;
     member_key_store_init(&member_keys);
 
@@ -1254,6 +1311,17 @@ int main(int argc, char *argv[]) {
         storage_save_chain(&chain, CHAIN_FILE);
     } else {
         printf("Loaded existing chain with %d block(s).\n", chain.count);
+    }
+
+    /* The loaded chain is re-validated before any further operation is
+     * permitted this session - this is what lets a restart after
+     * tamper_block actually show the tamper being caught automatically,
+     * not just when validate_chain happens to be run manually. */
+    printf("Validating loaded chain...\n");
+    if (!blockchain_validate(&chain, &member_keys)) {
+        printf("WARNING: the loaded chain failed validation above - do not trust its history until this is resolved.\n");
+    } else {
+        printf("Chain is VALID.\n");
     }
 
     PendingPool pool;
@@ -1345,7 +1413,7 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(cmd, "renew_book") == 0) {
             handle_renew_book(&pool, &chain, &inv, &reservations, &member_keys, &nonces);
         } else if (strcmp(cmd, "reserve_book") == 0) {
-            handle_reserve_book(&reg, &inv, &reservations);
+            handle_reserve_book(&reg, &inv, &reservations, &pool, &chain, &member_keys, &nonces);
         } else if (strcmp(cmd, "reservation_status") == 0) {
             handle_reservation_status(&reservations);
         } else if (strcmp(cmd, "check_overdue") == 0) {
@@ -1364,15 +1432,22 @@ int main(int argc, char *argv[]) {
             pending_pool_prioritize(&pool, &reservations);
             pending_pool_print(&pool);
         } else if (strcmp(cmd, "mine_solo") == 0) {
-            handle_mine_solo(&chain, &pool, difficulty, model, &utxos, &accounts, &fines, &nonces, &reservations);
+            handle_mine_solo(&chain, &pool, difficulty, model, &utxos, &accounts, &fines, &nonces, &reservations,
+                              &member_keys);
+            storage_save_difficulty(difficulty, DIFFICULTY_FILE);
         } else if (strcmp(cmd, "mine_pool") == 0) {
-            handle_mine_pool(&chain, &pool, difficulty, model, &utxos, &accounts, &fines, &nonces, &reservations);
+            handle_mine_pool(&chain, &pool, difficulty, model, &utxos, &accounts, &fines, &nonces, &reservations,
+                              &member_keys);
+            storage_save_difficulty(difficulty, DIFFICULTY_FILE);
         } else if (strcmp(cmd, "mine_cloud") == 0) {
-            handle_mine_cloud(&chain, &pool, difficulty, model, &utxos, &accounts, &fines, &nonces, &reservations, arg);
+            handle_mine_cloud(&chain, &pool, difficulty, model, &utxos, &accounts, &fines, &nonces, &reservations,
+                               &member_keys, arg);
+            storage_save_difficulty(difficulty, DIFFICULTY_FILE);
         } else if (strcmp(cmd, "difficulty_status") == 0) {
             printf("Current mining difficulty: %d (range %d-%d)\n", difficulty, MIN_DIFFICULTY, MAX_DIFFICULTY);
         } else if (strcmp(cmd, "set_difficulty") == 0) {
             difficulty = handle_set_difficulty(difficulty);
+            storage_save_difficulty(difficulty, DIFFICULTY_FILE);
         } else if (strcmp(cmd, "chain_view") == 0) {
             blockchain_print_records(&chain, &member_keys);
         } else if (strcmp(cmd, "validate_chain") == 0) {
@@ -1389,7 +1464,7 @@ int main(int argc, char *argv[]) {
                 printf("ERROR: Could not load %s\n", CHAIN_FILE);
             }
         } else if (strcmp(cmd, "tamper_block") == 0) {
-            handle_tamper_demo(&chain);
+            handle_tamper_demo(&chain, &member_keys);
         } else if (strcmp(cmd, "replay_test") == 0) {
             handle_replay_test(&pool, &chain, arg);
         } else if (strcmp(cmd, "lending_history") == 0) {

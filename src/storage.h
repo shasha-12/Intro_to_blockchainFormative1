@@ -49,4 +49,11 @@ int storage_load_nonce_registry(NonceRegistry *reg, const char *path);
 
 int storage_save_nonce_registry(const NonceRegistry *reg, const char *path);
 
+/* Persists the mining difficulty (part of the chain's session metadata)
+ * so it survives a restart instead of silently resetting to the default
+ * every time the program is run without an explicit --difficulty flag. */
+int storage_load_difficulty(int *difficulty, const char *path);
+
+int storage_save_difficulty(int difficulty, const char *path);
+
 #endif

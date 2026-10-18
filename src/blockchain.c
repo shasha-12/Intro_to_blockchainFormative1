@@ -21,6 +21,18 @@ void blockchain_free(Blockchain *chain) {
     chain->capacity = 0;
 }
 
+/* A full, independent copy - Block has no pointers inside it, so a plain
+ * array copy is a real deep copy. Used by the tamper demo so it can
+ * corrupt and validate a throwaway chain instead of the real one. */
+void blockchain_clone(const Blockchain *src, Blockchain *dst) {
+    dst->count = src->count;
+    dst->capacity = src->count > 0 ? src->count : 1;
+    dst->blocks = malloc(sizeof(Block) * (size_t)dst->capacity);
+    if (src->count > 0) {
+        memcpy(dst->blocks, src->blocks, sizeof(Block) * (size_t)src->count);
+    }
+}
+
 static void ensure_capacity(Blockchain *chain) {
     if (chain->count >= chain->capacity) {
         chain->capacity *= 2;
@@ -49,10 +61,10 @@ int blockchain_verify_record(const LendingRecord *r, EVP_PKEY *pkey) {
 }
 
 static size_t build_block_buffer(const Block *b, char *out, size_t out_size) {
-    int n = snprintf(out, out_size, "%d|%ld|%d|%s|%s|%s|%d|%s|%lu",
+    int n = snprintf(out, out_size, "%d|%ld|%d|%s|%s|%s|%d|%d|%s|%lu",
                       b->index, (long)b->timestamp, b->record_count,
                       b->previous_hash, b->merkle_root, b->sealed_by,
-                      b->token_reward, b->transaction_id, b->nonce);
+                      b->difficulty, b->token_reward, b->transaction_id, b->nonce);
     return n > 0 ? (size_t)n : 0;
 }
 
@@ -81,6 +93,7 @@ int blockchain_add_genesis(Blockchain *chain) {
     strncpy(b->sealed_by, ACTION_GENESIS, sizeof(b->sealed_by) - 1);
     b->sealed_by[sizeof(b->sealed_by) - 1] = '\0';
     b->nonce = 0;
+    b->difficulty = 0;
     b->token_reward = 0;
     memset(b->transaction_id, '0', 64);
     b->transaction_id[64] = '\0';
@@ -91,9 +104,13 @@ int blockchain_add_genesis(Blockchain *chain) {
 }
 
 void blockchain_seal_block(Block *b, const LendingRecord *records, int count,
-                            int index, const char *previous_hash, const char *sealed_by) {
+                            int index, const char *previous_hash, time_t previous_timestamp,
+                            const char *sealed_by, int difficulty) {
     b->index = index;
     b->timestamp = time(NULL);
+    if (b->timestamp <= previous_timestamp) {
+        b->timestamp = previous_timestamp + 1;
+    }
     b->record_count = count;
     for (int i = 0; i < count; i++) {
         b->records[i] = records[i];
@@ -104,6 +121,7 @@ void blockchain_seal_block(Block *b, const LendingRecord *records, int count,
     strncpy(b->sealed_by, sealed_by, sizeof(b->sealed_by) - 1);
     b->sealed_by[sizeof(b->sealed_by) - 1] = '\0';
     b->nonce = 0;
+    b->difficulty = difficulty;
     b->token_reward = 0;
     memset(b->transaction_id, '0', 64);
     b->transaction_id[64] = '\0';
@@ -156,14 +174,26 @@ int blockchain_validate(const Blockchain *chain, MemberKeyStore *keys) {
             }
         }
 
-        printf("Block %d [%d record(s)]: hash %s, link %s, merkle %s, signatures %s\n",
+        int pow_ok = 1;
+        for (int d = 0; d < b->difficulty; d++) {
+            if (b->hash[d] != '0') {
+                pow_ok = 0;
+                break;
+            }
+        }
+
+        int timestamp_ok = (i == 0) || (b->timestamp > chain->blocks[i - 1].timestamp);
+
+        printf("Block %d [%d record(s)]: hash %s, link %s, merkle %s, pow %s, timestamp %s, signatures %s\n",
                b->index, b->record_count,
                hash_ok ? "OK" : "MISMATCH",
                link_ok ? "OK" : "BROKEN",
                merkle_ok ? "OK" : "MISMATCH",
+               pow_ok ? "OK" : "BELOW TARGET",
+               timestamp_ok ? "OK" : "OUT OF ORDER",
                sig_ok ? "VALID" : "INVALID");
 
-        if (!hash_ok || !link_ok || !merkle_ok || !sig_ok) {
+        if (!hash_ok || !link_ok || !merkle_ok || !pow_ok || !timestamp_ok || !sig_ok) {
             all_valid = 0;
         }
     }
